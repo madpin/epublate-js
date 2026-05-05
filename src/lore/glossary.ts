@@ -34,6 +34,7 @@ import {
 import type { GlossaryEntryWithAliases } from "@/glossary/models";
 
 import { refreshLoreLibraryCounts } from "./lore";
+import { embedAndStoreLoreEntries } from "./embeddings";
 
 export interface CreateLoreEntryInput {
   source_term: string | null;
@@ -130,6 +131,8 @@ export async function createLoreEntry(
     },
   );
   await refreshLoreLibraryCounts(lore_id);
+  // Embed best-effort — failure must not break entry creation.
+  void embedAndStoreLoreEntries(lore_id, [entry]).catch(() => {});
   return rowToWith(entry, src, tgt);
 }
 
@@ -246,6 +249,9 @@ export async function updateLoreEntry(
   );
   if (!updated) throw new Error(`lore entry not found: ${entry_id}`);
   await refreshLoreLibraryCounts(lore_id);
+  // Re-embed if any of the embedded fields changed (target_term /
+  // notes — type and status don't shift the embedding text).
+  void embedAndStoreLoreEntries(lore_id, [updated]).catch(() => {});
   return updated;
 }
 
@@ -266,6 +272,8 @@ export async function deleteLoreEntry(
     },
   );
   await refreshLoreLibraryCounts(lore_id);
+  const { deleteEmbeddingsForRef } = await import("@/db/repo/embeddings");
+  await deleteEmbeddingsForRef("lore", lore_id, "glossary_entry", entry_id);
 }
 
 export async function setLoreEntryAliases(

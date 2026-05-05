@@ -24,22 +24,39 @@ import {
   type AttachedLoreRow,
   AttachedLoreMode,
 } from "@/db/schema";
+import { cosineTopK } from "@/db/repo/embeddings";
 
 import { listLoreEntries } from "./glossary";
 
-export interface AttachLoreInput {
-  project_id: string;
-  lore_id: string;
-  mode?: AttachedLoreModeT;
-  /** Higher = wins on conflicts. Defaults to next-highest priority. */
-  priority?: number;
-}
+/** Defaults applied per-attachment when the row doesn't carry overrides. */
+export const DEFAULT_RETRIEVAL_TOP_K = 16;
+export const DEFAULT_RETRIEVAL_MIN_SIMILARITY = 0.7;
 
 /**
  * Attach a Lore Book to a project. Idempotent on
  * `(project_id, lore_id)` — if the row already exists, this updates
  * mode + priority instead of inserting a duplicate.
  */
+export interface AttachLoreInput {
+  project_id: string;
+  lore_id: string;
+  mode?: AttachedLoreModeT;
+  /** Higher = wins on conflicts. Defaults to next-highest priority. */
+  priority?: number;
+  /**
+   * Embedding-retrieval top-K override. `null` is the explicit
+   * "flatten everything" toggle (legacy v1 behaviour); `undefined`
+   * means "preserve whatever the existing row had". `0` is a synonym
+   * for `null` (skip retrieval).
+   */
+  retrieval_top_k?: number | null;
+  /**
+   * Embedding-retrieval minimum cosine. Same null/undefined semantics
+   * as `retrieval_top_k` above.
+   */
+  retrieval_min_similarity?: number | null;
+}
+
 export async function attachLoreBook(
   input: AttachLoreInput,
 ): Promise<AttachedLoreRow> {
@@ -54,6 +71,12 @@ export async function attachLoreBook(
       mode: input.mode ?? existing.mode,
       priority: input.priority ?? existing.priority,
     };
+    if (input.retrieval_top_k !== undefined) {
+      patch.retrieval_top_k = input.retrieval_top_k;
+    }
+    if (input.retrieval_min_similarity !== undefined) {
+      patch.retrieval_min_similarity = input.retrieval_min_similarity;
+    }
     await db.attached_lore.update(existing.id, patch);
     await db.events.add({
       project_id: input.project_id,
@@ -83,6 +106,8 @@ export async function attachLoreBook(
     mode: input.mode ?? AttachedLoreMode.READ_ONLY,
     priority: next_priority,
     attached_at: nowMs(),
+    retrieval_top_k: input.retrieval_top_k ?? null,
+    retrieval_min_similarity: input.retrieval_min_similarity ?? null,
   };
   await db.attached_lore.put(row);
   await db.events.add({
@@ -173,6 +198,25 @@ export async function setAttachedLorePriority(
 }
 
 /**
+ * Optional embedding-retrieval context for `resolveProjectGlossaryWithLore`.
+ *
+ * When provided, each attached Lore Book is filtered down to its top-K
+ * entries closest to the segment vector (per-attachment overrides
+ * win over the global defaults). When `segment_vec` is omitted, the
+ * resolver falls back to the legacy "flatten everything" behaviour.
+ */
+export interface LoreRetrievalContext {
+  /** Encoder output for the current segment's source text. */
+  segment_vec: Float32Array;
+  /** Encoder identifier; matches the `model` column in `embeddings`. */
+  embedding_model: string;
+  /** Override the default top-K when an attachment doesn't carry one. */
+  default_top_k?: number;
+  /** Override the default min similarity when an attachment doesn't carry one. */
+  default_min_similarity?: number;
+}
+
+/**
  * Build the projected glossary state used by the translator pipeline.
  *
  * Combines the project's own glossary entries with the glossary entries
@@ -189,18 +233,35 @@ export async function setAttachedLorePriority(
  *     target-only entries;
  *   - the first occurrence in walk order wins (project → highest
  *     priority lore → … → lowest priority lore).
+ *
+ * When `retrieval` is provided, the per-Lore-Book entries are
+ * pre-filtered to the top-K cosine matches against the segment vector.
+ * When `retrieval` is `null` / `undefined`, every entry from every
+ * attached Lore Book is considered (legacy v1 behaviour).
  */
 export async function resolveProjectGlossaryWithLore(
   project_id: string,
-  project_entries: Awaited<
-    ReturnType<typeof import("@/db/repo/glossary").listGlossaryEntries>
+  project_entries: ReadonlyArray<
+    Awaited<
+      ReturnType<typeof import("@/db/repo/glossary").listGlossaryEntries>
+    >[number]
   >,
-): Promise<typeof project_entries> {
+  retrieval: LoreRetrievalContext | null = null,
+): Promise<
+  Array<
+    Awaited<
+      ReturnType<typeof import("@/db/repo/glossary").listGlossaryEntries>
+    >[number]
+  >
+> {
+  type EntryT = Awaited<
+    ReturnType<typeof import("@/db/repo/glossary").listGlossaryEntries>
+  >[number];
   const attached = await listAttachedLore(project_id);
-  if (attached.length === 0) return project_entries;
+  if (attached.length === 0) return [...project_entries];
   const seen_source = new Set<string>();
   const seen_target_only = new Set<string>();
-  const merged: typeof project_entries = [];
+  const merged: EntryT[] = [];
 
   for (const e of project_entries) {
     if (e.entry.source_term && e.entry.source_known !== false) {
@@ -213,12 +274,62 @@ export async function resolveProjectGlossaryWithLore(
     merged.push(e);
   }
 
+  const default_top_k =
+    retrieval?.default_top_k ?? DEFAULT_RETRIEVAL_TOP_K;
+  const default_min_similarity =
+    retrieval?.default_min_similarity ?? DEFAULT_RETRIEVAL_MIN_SIMILARITY;
+
   for (const att of attached) {
-    let lore_entries: typeof project_entries;
+    let lore_entries: EntryT[];
     try {
       lore_entries = await listLoreEntries(att.lore_path);
     } catch {
       continue;
+    }
+    if (retrieval) {
+      const top_k_setting =
+        att.retrieval_top_k != null ? att.retrieval_top_k : default_top_k;
+      const min_sim =
+        att.retrieval_min_similarity != null
+          ? att.retrieval_min_similarity
+          : default_min_similarity;
+      // `top_k <= 0` is the explicit "skip retrieval, fall back to
+      // flat merge" knob. The Lore-Book attach modal exposes it as a
+      // checkbox to keep parity with the v1 flow.
+      if (top_k_setting > 0) {
+        const non_proposed_ids = new Set(
+          lore_entries
+            .filter((e) => e.entry.status !== "proposed")
+            .map((e) => e.entry.id),
+        );
+        if (non_proposed_ids.size === 0) continue;
+        let hits: Awaited<ReturnType<typeof cosineTopK>>;
+        try {
+          hits = await cosineTopK(
+            "lore",
+            att.lore_path,
+            "glossary_entry",
+            retrieval.embedding_model,
+            retrieval.segment_vec,
+            {
+              k: top_k_setting,
+              min_similarity: min_sim,
+              filter: non_proposed_ids,
+            },
+          );
+        } catch {
+          hits = [];
+        }
+        if (hits.length > 0) {
+          const hit_ids = new Set(hits.map((h) => h.ref_id));
+          lore_entries = lore_entries.filter((e) => hit_ids.has(e.entry.id));
+        } else {
+          // No embeddings for this Lore Book yet. Skip the entire
+          // attachment rather than blasting every entry into the
+          // prompt — that's what the legacy path is for.
+          continue;
+        }
+      }
     }
     for (const e of lore_entries) {
       if (e.entry.status === "proposed") continue;

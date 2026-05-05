@@ -38,7 +38,8 @@ export interface CreateProjectInput {
   budget_usd?: number | null;
   context_max_segments?: number;
   context_max_chars?: number;
-  context_mode?: "off" | "previous" | "dialogue";
+  context_mode?: "off" | "previous" | "dialogue" | "relevant";
+  context_relevant_min_similarity?: number | null;
 }
 
 export async function createProject(
@@ -62,6 +63,8 @@ export async function createProject(
     context_max_segments: input.context_max_segments ?? 0,
     context_max_chars: input.context_max_chars ?? 0,
     context_mode: input.context_mode ?? "previous",
+    context_relevant_min_similarity:
+      input.context_relevant_min_similarity ?? null,
   };
 
   const bytes = input.source_bytes;
@@ -189,7 +192,12 @@ export interface UpdateProjectSettingsPatch {
   budget_usd?: number | null;
   context_max_segments?: number;
   context_max_chars?: number;
-  context_mode?: "off" | "previous" | "dialogue";
+  context_mode?: "off" | "previous" | "dialogue" | "relevant";
+  /**
+   * Minimum cosine similarity for `context_mode = "relevant"`. Pass
+   * `null` to clear and fall back to the default. Phase 3.
+   */
+  context_relevant_min_similarity?: number | null;
   /** Pass an object to set, or `null` to clear. Will be JSON-stringified. */
   llm_overrides?: object | null;
 }
@@ -212,6 +220,10 @@ export async function updateProjectSettings(
   }
   if (patch.context_mode !== undefined) {
     project_patch.context_mode = patch.context_mode;
+  }
+  if (patch.context_relevant_min_similarity !== undefined) {
+    project_patch.context_relevant_min_similarity =
+      patch.context_relevant_min_similarity;
   }
   if (patch.llm_overrides !== undefined) {
     project_patch.llm_overrides = patch.llm_overrides

@@ -133,6 +133,18 @@ export async function createGlossaryEntry(
       if (aliasRows.length) await db.glossary_aliases.bulkPut(aliasRows);
     },
   );
+  // Phase 4: embed the entry so the proposed-hints retrieval has a
+  // vector for it next time the translator runs. Best-effort.
+  void (async () => {
+    try {
+      const { embedAndStoreProjectGlossaryEntries } = await import(
+        "@/glossary/embeddings"
+      );
+      await embedAndStoreProjectGlossaryEntries(projectId, [entry]);
+    } catch {
+      // never block the create on an embedding hiccup
+    }
+  })();
   return rowToWith(entry, src, tgt);
 }
 
@@ -273,6 +285,29 @@ export async function updateGlossaryEntry(
     },
   );
   if (!updated) throw new Error(`glossary entry not found: ${entryId}`);
+  // Phase 4: re-embed the entry whenever the canonical text shifts.
+  // Status changes are intentionally NOT re-embedded — the embedding
+  // text excludes status, so the existing vector is still correct.
+  // We re-embed on target_term / type / gender / notes flips because
+  // any of those can change the curator's intended sense.
+  if (
+    patch.target_term !== undefined ||
+    patch.type !== undefined ||
+    patch.gender !== undefined ||
+    patch.notes !== undefined
+  ) {
+    const refreshed = updated;
+    void (async () => {
+      try {
+        const { embedAndStoreProjectGlossaryEntries } = await import(
+          "@/glossary/embeddings"
+        );
+        await embedAndStoreProjectGlossaryEntries(projectId, [refreshed]);
+      } catch {
+        // never block the update on an embedding hiccup
+      }
+    })();
+  }
   return updated;
 }
 
@@ -294,6 +329,18 @@ export async function deleteGlossaryEntry(
       await db.entity_mentions.where("entry_id").equals(entryId).delete();
     },
   );
+  // Phase 4: clean up any embedding row tied to this entry so the
+  // proposed-hints retriever doesn't return stale references.
+  void (async () => {
+    try {
+      const { deleteProjectGlossaryEntryEmbeddings } = await import(
+        "@/glossary/embeddings"
+      );
+      await deleteProjectGlossaryEntryEmbeddings(projectId, entryId);
+    } catch {
+      // best-effort cleanup
+    }
+  })();
 }
 
 /**

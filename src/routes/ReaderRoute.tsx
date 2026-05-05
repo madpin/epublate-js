@@ -88,6 +88,8 @@ import {
 } from "@/lib/reader_position";
 import { type LLMProvider } from "@/llm/base";
 import { buildProvider, type ProjectLlmOverrides } from "@/llm/factory";
+import { type EmbeddingProvider } from "@/llm/embeddings/base";
+import { buildEmbeddingProvider } from "@/llm/embeddings/factory";
 import { cn } from "@/lib/utils";
 import { useAppStore } from "@/state/app";
 import {
@@ -169,11 +171,30 @@ export function ReaderRoute(): React.JSX.Element {
   // Glossary state — passed through to `translateSegment` so the LLM
   // sees the curator's locked terms and the cache key reflects glossary
   // edits. `useLiveQuery` re-fires on any glossary write.
+  //
+  // When an embedding provider is configured we keep the merged set
+  // here for the legacy "show every Lore Book in the glossary panel"
+  // UX, *but* the actual prompt-time merge happens per-segment inside
+  // `translateSegment` via the `lore_retrieval` hook. So we always
+  // return the flattened set regardless of `embedding_provider`.
   const glossary_state = useLiveQuery(
     async () => {
       if (!projectId) return [];
       const own = await listGlossaryEntries(projectId);
       return resolveProjectGlossaryWithLore(projectId, own);
+    },
+    [projectId],
+    [],
+  );
+
+  // Project-side-only glossary state, used as the seed for per-segment
+  // retrieval when an embedding provider is available. Kept as a
+  // separate query so the displayed glossary panel still shows every
+  // attached Lore-Book entry.
+  const project_only_glossary_state = useLiveQuery(
+    async () => {
+      if (!projectId) return [];
+      return listGlossaryEntries(projectId);
     },
     [projectId],
     [],
@@ -502,6 +523,13 @@ export function ReaderRoute(): React.JSX.Element {
     ProviderHandle | null
   >(null);
   const [provider_error, setProviderError] = React.useState<string | null>(null);
+  // Optional embedding provider for per-segment Lore-Book retrieval.
+  // `null` means embeddings are disabled or failed to build — the
+  // pipeline gracefully falls back to the legacy flatten-everything
+  // merge when this is null.
+  const [embedding_provider, setEmbeddingProvider] = React.useState<
+    EmbeddingProvider | null
+  >(null);
   // The global translating set is already subscribed above (so the
   // running-by-chapter query can depend on it). Here we just need
   // the mutators that the per-segment translate flow uses.
@@ -533,6 +561,23 @@ export function ReaderRoute(): React.JSX.Element {
         const msg = err instanceof Error ? err.message : String(err);
         setProviderHandle(null);
         setProviderError(msg);
+      }
+      // Embedding provider is best-effort: a build failure should
+      // never break the inline-translate path. We just silently fall
+      // back to the legacy v1 merge when embeddings can't be loaded.
+      try {
+        const overrides = await readProjectOverrides(projectId);
+        const emb = await buildEmbeddingProvider({
+          mock: mock_mode,
+          overrides: overrides?.embedding ?? null,
+        });
+        if (!cancelled) {
+          setEmbeddingProvider(emb.provider);
+        }
+      } catch {
+        if (!cancelled) {
+          setEmbeddingProvider(null);
+        }
       }
     })();
     return () => {
@@ -573,6 +618,14 @@ export function ReaderRoute(): React.JSX.Element {
       const chapter_notes = chapter_row?.notes?.trim() || null;
       addTranslating(projectId, seg.id);
       try {
+        // When an embedding provider is wired up, hand the pipeline
+        // the project-side glossary only and let it merge attached
+        // Lore-Book entries via cosine top-K. Otherwise pass the
+        // already-flattened state for the legacy v1 path.
+        const using_retrieval = !!embedding_provider;
+        const passed_glossary = using_retrieval
+          ? project_only_glossary_state ?? []
+          : glossary_state ?? [];
         const outcome = await translateSegment({
           project_id: projectId,
           source_lang: detail.source_lang,
@@ -585,7 +638,13 @@ export function ReaderRoute(): React.JSX.Element {
             model: provider_handle.model,
             reasoning_effort: provider_handle.reasoning_effort,
             bypass_cache: options.bypass_cache,
-            glossary_state: glossary_state ?? [],
+            glossary_state: passed_glossary,
+            lore_retrieval: embedding_provider
+              ? { provider: embedding_provider }
+              : null,
+            // Phase 3: same provider drives `relevant` context mode
+            // when the curator hasn't attached a Lore Book.
+            embedding_provider: embedding_provider ?? null,
           },
         });
         if (outcome.violations.length) {
@@ -614,6 +673,8 @@ export function ReaderRoute(): React.JSX.Element {
       provider_error,
       detail,
       glossary_state,
+      project_only_glossary_state,
+      embedding_provider,
       addTranslating,
       removeTranslating,
     ],

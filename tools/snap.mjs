@@ -323,6 +323,26 @@ async function captureProjectSettings(page) {
   await page.locator('a[href$="/settings"]').nth(0).click();
   await page.waitForTimeout(1000);
   await snap(page, "09-project-settings");
+
+  // 09b — Relevant context mode. Switch the Context-window card's
+  // mode dropdown to "Relevant" so the cosine-similarity sub-control
+  // becomes visible, then snap the area with the "Embeddings
+  // (project override)" card scrolled into view alongside.
+  log("== Project settings → Relevant context mode ==");
+  // The Context window card uses a native <select id="ps-ctx-mode">.
+  const ctxMode = page.locator("#ps-ctx-mode");
+  if ((await ctxMode.count()) > 0) {
+    try {
+      await ctxMode.scrollIntoViewIfNeeded();
+      await ctxMode.selectOption({ value: "relevant" });
+      await page.waitForTimeout(300);
+      await snap(page, "09b-relevant-context-mode");
+    } catch (err) {
+      log("  could not switch to relevant mode:", err.message);
+    }
+  } else {
+    log("  context mode dropdown not found, skipping 09b");
+  }
 }
 
 async function captureLoreBooks(page) {
@@ -337,6 +357,25 @@ async function captureSettingsLlm(page) {
   await gotoMock(page, "/settings");
   await page.waitForTimeout(500);
   await snap(page, "12-settings-llm");
+
+  // 12b — Embeddings card (introduced in the embeddings retrieval
+  // layer). Scrolls the page so the card title is centered, then
+  // re-snaps. Falls back gracefully if the card is collapsed.
+  log("== Settings → Embeddings ==");
+  const embeddingsHeading = page
+    .getByRole("heading", { name: /^Embeddings$/ })
+    .first();
+  if ((await embeddingsHeading.count()) > 0) {
+    try {
+      await embeddingsHeading.scrollIntoViewIfNeeded();
+      await page.waitForTimeout(300);
+      await snap(page, "12b-embeddings-card");
+    } catch (err) {
+      log("  could not scroll to embeddings card:", err.message);
+    }
+  } else {
+    log("  embeddings heading not found, skipping 12b");
+  }
 }
 
 async function captureIntakeRuns(page) {

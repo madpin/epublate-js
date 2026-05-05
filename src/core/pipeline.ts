@@ -27,9 +27,20 @@ import {
   findLlmCallByCacheKey,
   insertLlmCall,
 } from "@/db/repo/llm_calls";
+import {
+  bulkUpsertEmbeddings,
+  getEmbedding,
+} from "@/db/repo/embeddings";
 import { getGlossaryEntry, recordMentions } from "@/db/repo/glossary";
 import { openProjectDb } from "@/db/dexie";
 import { SegmentStatus, type SegmentStatusT } from "@/db/schema";
+import {
+  PURPOSE_EMBEDDING,
+  type EmbeddingProvider,
+  EmbeddingError,
+  unpackFloat32,
+} from "@/llm/embeddings/base";
+import { resolveProjectGlossaryWithLore } from "@/lore/attach";
 import { type Segment } from "@/formats/epub/types";
 import {
   isTriviallyEmpty,
@@ -37,6 +48,7 @@ import {
 } from "@/formats/epub/segmentation";
 import {
   buildConstraints,
+  buildProposedHints,
   buildTargetOnlyConstraints,
   findMentions,
   findTargetDoubledParticles,
@@ -76,11 +88,22 @@ export interface ContextOptions {
    *     dialogue, and pull only previously translated dialogue
    *     segments. Cheaper for novels where dialogue is interleaved
    *     with descriptive narration.
+   *   - `"relevant"` — embed the segment and pick the top-K
+   *     translated/approved segments by cosine similarity, regardless
+   *     of chapter. Falls back to `"previous"` when no embedding
+   *     provider is configured. Phase 3.
    *
    * Defaults to `"previous"` to preserve the legacy behaviour for
    * existing projects.
    */
   mode?: ContextMode;
+  /**
+   * Minimum cosine similarity threshold for `mode = "relevant"`. The
+   * pipeline drops candidates below this score from the picker so the
+   * prompt never gets stuffed with weakly related neighbours. Defaults
+   * to `0.65` when omitted; ignored for other modes. Phase 3.
+   */
+  min_similarity?: number;
 }
 
 export const DEFAULT_CONTEXT_OPTIONS: ContextOptions = {
@@ -88,6 +111,54 @@ export const DEFAULT_CONTEXT_OPTIONS: ContextOptions = {
   max_chars: 0,
   mode: "previous",
 };
+
+/** Default min-similarity floor for `mode = "relevant"`. Phase 3. */
+export const DEFAULT_RELEVANT_MIN_SIMILARITY = 0.65;
+
+/**
+ * Per-segment Lore-Book retrieval hook.
+ *
+ * When set, the pipeline embeds the segment's source text once with
+ * the configured provider, persists the vector in `embeddings`, and
+ * passes it to `resolveProjectGlossaryWithLore` so each attached Lore
+ * Book is filtered down to its top-K closest entries. The caller
+ * supplies the project-side glossary state via `glossary_state`; the
+ * pipeline performs the merge itself.
+ *
+ * If the embedding call fails (provider rate-limited, model
+ * unavailable, …) the pipeline falls back to the legacy
+ * "flatten everything" behaviour — embedding failures must never
+ * block a translation.
+ */
+export interface LoreRetrievalOptions {
+  provider: EmbeddingProvider;
+  /**
+   * Override the per-attachment defaults; matches the resolver's
+   * `LoreRetrievalContext.default_*` knobs.
+   */
+  default_top_k?: number;
+  default_min_similarity?: number;
+}
+
+/**
+ * Phase 4: per-call knobs for proposed-entry hints.
+ *
+ * The pipeline always *attempts* the retrieval when an embedding
+ * vector is available; these options just control K and the
+ * similarity floor. Set `top_k = 0` to bypass the section entirely
+ * for a particular call (useful for test-mode runs where you want a
+ * fully-deterministic prompt).
+ */
+export interface ProposedHintsRetrievalOptions {
+  /** Default 8. Max number of proposed entries surfaced in the prompt. */
+  top_k?: number;
+  /**
+   * Default 0.72. Floor below which a candidate is dropped — keeps
+   * the section tight so the LLM doesn't drown in weakly-related
+   * suggestions.
+   */
+  min_similarity?: number;
+}
 
 export interface TranslateOptions {
   model: string;
@@ -105,8 +176,25 @@ export interface TranslateOptions {
    * Active glossary state for this segment. Drives the matcher, the
    * validator, and the cache hash. When omitted the pipeline behaves
    * as if there is no glossary.
+   *
+   * When `lore_retrieval` is set, this should contain the
+   * **project-side** entries only — the pipeline merges in attached
+   * Lore-Book entries itself. When `lore_retrieval` is unset, the
+   * caller is expected to have pre-merged any Lore-Book state.
    */
   glossary_state?: readonly GlossaryEntryWithAliases[] | null;
+  /** Optional embedding-based Lore-Book retrieval (Phase 2). */
+  lore_retrieval?: LoreRetrievalOptions | null;
+  /**
+   * Optional embedding provider used for `context.mode = "relevant"`
+   * (Phase 3) when `lore_retrieval` is not set. The pipeline embeds
+   * the source text once with this provider, persists the vector,
+   * and reuses it for cosine top-K context picking. When `null` the
+   * pipeline falls back to `previous` mode for any `relevant` request.
+   */
+  embedding_provider?: EmbeddingProvider | null;
+  /** Phase 4: proposed-entry hint retrieval. */
+  proposed_hints?: ProposedHintsRetrievalOptions | null;
   bypass_cache?: boolean;
   response_format?: ResponseFormat | null;
   reasoning_effort?: "minimal" | "low" | "medium" | "high" | null;
@@ -164,7 +252,61 @@ export async function translateSegment(
     return shortCircuitTrivial({ project_id, segment });
   }
 
-  const glossaryState = options.glossary_state ?? [];
+  // Phase 2 + 3: best-effort segment-source embedding. The vector is
+  // reused for two things in this call: (a) Lore-Book top-K
+  // retrieval before constraint building, and (b) `relevant` context
+  // mode in `collectContextSegments`. We compute it once and keep it
+  // around in `segment_vec_cache` so we don't double-charge.
+  //
+  // Embedding is opportunistic: whenever an embedding provider is
+  // available we embed + persist the segment, regardless of the
+  // active context mode. This lets `relevant` mode kick in mid-book
+  // without the curator running an explicit backfill pass — every
+  // segment translated since the provider was configured already
+  // contributes to the candidate pool. The cached vector is reused
+  // for downstream Lore-Book retrieval and `relevant` context picks
+  // so each segment costs at most one `embed()` round-trip.
+  const project_glossary = options.glossary_state ?? [];
+  let glossaryState: readonly GlossaryEntryWithAliases[] = project_glossary;
+  let segment_vec_cache: Float32Array | null = null;
+  let embedding_model_used: string | null = null;
+  // `lore_retrieval.provider` and `embedding_provider` should
+  // normally be the same instance (the batch runner passes both),
+  // but we treat them as independent capabilities so a caller can
+  // opt into one without the other.
+  const active_emb_provider =
+    options.lore_retrieval?.provider ?? options.embedding_provider ?? null;
+  if (active_emb_provider) {
+    const result = await embedAndPersistSegment({
+      project_id,
+      segment,
+      provider: active_emb_provider,
+      signal: options.signal,
+    });
+    segment_vec_cache = result.segment_vec;
+    embedding_model_used = active_emb_provider.model;
+  }
+  if (options.lore_retrieval && segment_vec_cache) {
+    glossaryState = await resolveProjectGlossaryWithLore(
+      project_id,
+      project_glossary,
+      {
+        segment_vec: segment_vec_cache,
+        embedding_model: options.lore_retrieval.provider.model,
+        default_top_k: options.lore_retrieval.default_top_k,
+        default_min_similarity: options.lore_retrieval.default_min_similarity,
+      },
+    );
+  } else if (options.lore_retrieval) {
+    // Embedding failed but Lore Books are attached → fall back to
+    // the legacy flat merge so the prompt still sees them.
+    glossaryState = await resolveProjectGlossaryWithLore(
+      project_id,
+      project_glossary,
+      null,
+    );
+  }
+
   const projected: readonly GlossaryConstraint[] = options.glossary ??
     buildConstraints(glossaryState);
   const targetOnly: readonly TargetOnlyConstraint[] =
@@ -173,10 +315,35 @@ export async function translateSegment(
     ? await computeGlossaryHash(glossaryState)
     : EMPTY_GLOSSARY_HASH;
 
+  // Phase 4: surface relevant *proposed* glossary entries as soft
+  // hints. Skipped entirely when no embedding vector is available
+  // (no provider configured, or embed() failed) so existing
+  // configurations behave exactly as before.
+  let proposed_hints_block = "";
+  let proposed_hints_used: readonly string[] = [];
+  if (segment_vec_cache && embedding_model_used) {
+    const hints = await retrieveProposedHints({
+      project_id,
+      segment_vec: segment_vec_cache,
+      embedding_model: embedding_model_used,
+      project_glossary,
+      options: options.proposed_hints ?? null,
+    });
+    proposed_hints_block = hints.block;
+    proposed_hints_used = hints.used_ids;
+  }
+
   const context = await collectContextSegments({
     project_id,
     segment,
     options: options.context ?? null,
+    embedding_context:
+      segment_vec_cache && embedding_model_used
+        ? {
+            segment_vec: segment_vec_cache,
+            embedding_model: embedding_model_used,
+          }
+        : null,
   });
 
   const messages = buildTranslatorMessages({
@@ -187,6 +354,7 @@ export async function translateSegment(
     chapter_notes: chapter_notes ?? null,
     glossary: projected,
     target_only_glossary: targetOnly,
+    proposed_hints_block,
     context,
   });
 
@@ -203,6 +371,9 @@ export async function translateSegment(
     temperature: options.temperature ?? null,
     seed: options.seed ?? null,
     glossary_hash,
+    proposed_hints_used: proposed_hints_used.length
+      ? [...proposed_hints_used].sort()
+      : undefined,
   };
   const request_json = stableStringify(request_payload);
 
@@ -589,6 +760,16 @@ interface CollectContextInput {
   project_id: string;
   segment: Segment;
   options: ContextOptions | null;
+  /**
+   * Phase 3: when set, the `"relevant"` mode is allowed to query
+   * `segment_embeddings` for cosine top-K matches. When unset
+   * (no embedding provider configured), `"relevant"` mode silently
+   * falls back to `"previous"`.
+   */
+  embedding_context?: {
+    segment_vec: Float32Array;
+    embedding_model: string;
+  } | null;
 }
 
 /**
@@ -608,11 +789,29 @@ interface CollectContextInput {
 async function collectContextSegments(
   input: CollectContextInput,
 ): Promise<ContextSegment[]> {
-  const { project_id, segment } = input;
+  const { project_id, segment, embedding_context } = input;
   const opts = await resolveContextOptions(project_id, input.options);
-  const mode: ContextMode = opts.mode ?? "previous";
+  let mode: ContextMode = opts.mode ?? "previous";
   if (mode === "off") return [];
   if (opts.max_segments <= 0) return [];
+
+  // Phase 3: `relevant` mode delegates to the embedding-based picker
+  // when a segment vector is available. When embeddings are off (no
+  // provider configured, or the embedding step failed earlier in the
+  // pipeline) we silently fall back to `"previous"` so the prompt is
+  // never empty just because the user picked the wrong mode.
+  if (mode === "relevant") {
+    if (embedding_context) {
+      return collectRelevantContextSegments({
+        project_id,
+        segment,
+        opts,
+        segment_vec: embedding_context.segment_vec,
+        embedding_model: embedding_context.embedding_model,
+      });
+    }
+    mode = "previous";
+  }
 
   // Dialogue-aware mode: only fetch context when *this* segment looks
   // like dialogue. Narration / descriptive prose translates without
@@ -675,6 +874,198 @@ async function collectContextSegments(
   return context;
 }
 
+interface CollectRelevantInput {
+  project_id: string;
+  segment: Segment;
+  opts: ContextOptions;
+  segment_vec: Float32Array;
+  embedding_model: string;
+}
+
+/**
+ * Phase 3: cosine top-K context picker.
+ *
+ * Selects translated / approved segments earlier in spine order and
+ * ranks them by similarity against the current segment's vector. The
+ * shape of the returned `ContextSegment[]` matches the legacy
+ * `previous` mode so the prompt block doesn't change.
+ *
+ * Eligibility filter (mirrors the plan):
+ * - `status ∈ {translated, approved}` — the LLM should never see a
+ *   pending source-only neighbour as authoritative.
+ * - Earlier in spine than the current segment. We compare on
+ *   `(spine_idx, idx)` so segments from earlier chapters always
+ *   outrank later ones at the same idx.
+ * - Has a non-empty target text (otherwise there's nothing useful to
+ *   show the LLM).
+ *
+ * The top-K cap is `opts.max_segments`. `min_similarity` defaults to
+ * 0.65 — slightly lower than Lore-Book retrieval because we want at
+ * least *some* context across the book, not "perfect matches only".
+ */
+async function collectRelevantContextSegments(
+  input: CollectRelevantInput,
+): Promise<ContextSegment[]> {
+  const { project_id, segment, opts, segment_vec, embedding_model } = input;
+  const { cosineTopK } = await import("@/db/repo/embeddings");
+  const db = openProjectDb(project_id);
+  // Resolve the current chapter's spine index so we can scope the
+  // candidate set to "earlier in book" without joining manually.
+  const cur_chapter = await db.chapters.get(segment.chapter_id);
+  if (!cur_chapter) return [];
+  const cur_spine = cur_chapter.spine_idx;
+
+  // Pull every translated/approved segment in the project. This is a
+  // simpler filter than over-fetching from `[chapter_id+idx]` because
+  // `relevant` deliberately ignores chapter boundaries.
+  const candidates = await db.segments
+    .where("status")
+    .anyOf([SegmentStatus.TRANSLATED, SegmentStatus.APPROVED])
+    .filter((row) => row.id !== segment.id && !!row.target_text?.trim())
+    .toArray();
+
+  // Spine ordering: drop any segment that lives at the same chapter +
+  // idx (or later) than the current one, so the LLM doesn't get a
+  // "future" neighbour. We resolve chapter spine indexes lazily and
+  // memoise them.
+  const spine_cache = new Map<string, number>();
+  spine_cache.set(segment.chapter_id, cur_spine);
+  const earlier: typeof candidates = [];
+  for (const row of candidates) {
+    let row_spine = spine_cache.get(row.chapter_id);
+    if (row_spine === undefined) {
+      const ch = await db.chapters.get(row.chapter_id);
+      if (!ch) continue;
+      row_spine = ch.spine_idx;
+      spine_cache.set(row.chapter_id, row_spine);
+    }
+    if (row_spine > cur_spine) continue;
+    if (row_spine === cur_spine && row.idx >= segment.idx) continue;
+    earlier.push(row);
+  }
+  if (earlier.length === 0) return [];
+
+  // Linear-scan top-K via the shared helper. We pass the candidate
+  // ref-id allow-list so cosine ranking only touches eligible rows.
+  const allow = new Set(earlier.map((r) => r.id));
+  const min_sim =
+    typeof opts.min_similarity === "number" &&
+    Number.isFinite(opts.min_similarity)
+      ? opts.min_similarity
+      : DEFAULT_RELEVANT_MIN_SIMILARITY;
+  const hits = await cosineTopK(
+    "project",
+    project_id,
+    "segment",
+    embedding_model,
+    segment_vec,
+    {
+      k: Math.max(1, opts.max_segments),
+      min_similarity: min_sim,
+      filter: allow,
+      exclude_ref_id: segment.id,
+    },
+  );
+  if (hits.length === 0) return [];
+
+  const by_id = new Map(earlier.map((r) => [r.id, r] as const));
+  const context: ContextSegment[] = [];
+  let chars = 0;
+  for (const hit of hits) {
+    const row = by_id.get(hit.ref_id);
+    if (!row) continue;
+    const piece = row.source_text.length + (row.target_text?.length ?? 0);
+    if (
+      opts.max_chars > 0 &&
+      context.length > 0 &&
+      chars + piece > opts.max_chars
+    ) {
+      break;
+    }
+    context.push({
+      source_text: row.source_text,
+      target_text: row.target_text,
+      // `segments_back` doesn't have a natural meaning for cross-
+      // chapter retrieval; we surface the chapter offset instead so
+      // the prompt's "x segments back" doesn't lie.
+      segments_back: 0,
+    });
+    chars += piece;
+  }
+  return context;
+}
+
+interface RetrieveProposedHintsInput {
+  project_id: string;
+  segment_vec: Float32Array;
+  embedding_model: string;
+  project_glossary: readonly GlossaryEntryWithAliases[];
+  options: ProposedHintsRetrievalOptions | null;
+}
+
+/**
+ * Phase 4: retrieve top-K proposed entries by cosine similarity to
+ * the segment vector, then format the "Proposed terms (unvetted
+ * hints)" prompt block via `buildProposedHints`.
+ *
+ * Returns an empty block whenever:
+ * - no proposed entries exist in the project,
+ * - the embedding store has no vectors yet (provider just
+ *   configured, embeddings haven't backfilled), or
+ * - all candidates score below `min_similarity`.
+ *
+ * Best-effort: any unexpected DB / cosine failure collapses to an
+ * empty block so the translator still sees the locked / confirmed
+ * constraints exactly as before.
+ */
+async function retrieveProposedHints(
+  input: RetrieveProposedHintsInput,
+): Promise<{ block: string; used_ids: readonly string[] }> {
+  const proposed = input.project_glossary.filter(
+    (e) => e.entry.status === "proposed" && e.entry.source_term,
+  );
+  if (proposed.length === 0) return { block: "", used_ids: [] };
+  const top_k = input.options?.top_k ?? DEFAULT_HINT_TOP_K;
+  if (top_k <= 0) return { block: "", used_ids: [] };
+  const min_similarity =
+    input.options?.min_similarity ?? DEFAULT_HINT_MIN_SIMILARITY;
+  try {
+    const { cosineTopK: cosineTopKFn } = await import("@/db/repo/embeddings");
+    const allow = new Set(proposed.map((e) => e.entry.id));
+    // Slightly over-fetch so the deterministic tie-breaker in
+    // `buildProposedHints` has room to shuffle without dropping a
+    // qualified candidate.
+    const hits = await cosineTopKFn(
+      "project",
+      input.project_id,
+      "glossary_entry",
+      input.embedding_model,
+      input.segment_vec,
+      {
+        k: top_k,
+        min_similarity,
+        filter: allow,
+      },
+    );
+    if (hits.length === 0) return { block: "", used_ids: [] };
+    const sims = new Map<string, number>();
+    for (const hit of hits) sims.set(hit.ref_id, hit.similarity);
+    const built = buildProposedHints({
+      entries: proposed,
+      similarities: sims,
+      top_k,
+      min_similarity,
+    });
+    return { block: built.block, used_ids: built.used_ids };
+  } catch {
+    return { block: "", used_ids: [] };
+  }
+}
+
+/** Phase 4 default top-K — kept here so the helper above stays self-contained. */
+const DEFAULT_HINT_TOP_K = 8;
+const DEFAULT_HINT_MIN_SIMILARITY = 0.72;
+
 async function resolveContextOptions(
   project_id: string,
   override: ContextOptions | null,
@@ -687,6 +1078,11 @@ async function resolveContextOptions(
     max_segments: row.context_max_segments ?? 0,
     max_chars: row.context_max_chars ?? 0,
     mode: row.context_mode ?? "previous",
+    min_similarity:
+      row.context_relevant_min_similarity != null &&
+      Number.isFinite(row.context_relevant_min_similarity)
+        ? row.context_relevant_min_similarity
+        : DEFAULT_RELEVANT_MIN_SIMILARITY,
   };
 }
 
@@ -799,3 +1195,120 @@ function sortedReplacer(_key: string, value: unknown): unknown {
   }
   return value;
 }
+
+interface EmbedAndPersistSegmentInput {
+  project_id: string;
+  segment: Segment;
+  provider: EmbeddingProvider;
+  signal?: AbortSignal;
+}
+
+interface EmbedAndPersistSegmentResult {
+  segment_vec: Float32Array | null;
+}
+
+/**
+ * Best-effort segment embedding + persist.
+ *
+ * Used by both `lore_retrieval` (Phase 2) and pure `relevant` context
+ * mode (Phase 3). Returns `null` on any failure so the caller can
+ * gracefully fall back to legacy behaviour. The vector is cached in
+ * `embeddings` so subsequent calls (e.g. re-translations) skip the
+ * round-trip.
+ */
+async function embedAndPersistSegment(
+  input: EmbedAndPersistSegmentInput,
+): Promise<EmbedAndPersistSegmentResult> {
+  const { project_id, segment, provider, signal } = input;
+  try {
+    const cached = await getEmbedding(
+      "project",
+      project_id,
+      "segment",
+      segment.id,
+      provider.model,
+    );
+    if (cached) {
+      return { segment_vec: unpackFloat32(cached.vector) };
+    }
+    const result = await provider.embed([segment.source_text], signal);
+    const v = result.vectors[0];
+    if (!v) return { segment_vec: null };
+    const prompt_tokens = result.usage?.prompt_tokens ?? 0;
+    await persistSegmentEmbedding({
+      project_id,
+      segment_id: segment.id,
+      model: provider.model,
+      vector: v,
+      prompt_tokens,
+      cost_usd: estimateCost(provider.model, prompt_tokens, 0),
+    });
+    return { segment_vec: v };
+  } catch (err) {
+    if (err instanceof EmbeddingError) {
+      try {
+        const db = openProjectDb(project_id);
+        await db.events.add({
+          project_id,
+          ts: Date.now(),
+          kind: "embedding.failed",
+          payload_json: stableStringify({
+            segment_id: segment.id,
+            scope: "segment",
+            model: provider.model,
+            error: err.message,
+          }),
+        });
+      } catch {
+        // event log is best-effort
+      }
+    }
+    return { segment_vec: null };
+  }
+}
+
+interface PersistSegmentEmbeddingInput {
+  project_id: string;
+  segment_id: string;
+  model: string;
+  vector: Float32Array;
+  prompt_tokens: number;
+  cost_usd: number;
+}
+
+async function persistSegmentEmbedding(
+  input: PersistSegmentEmbeddingInput,
+): Promise<void> {
+  try {
+    await bulkUpsertEmbeddings("project", input.project_id, [
+      {
+        scope: "segment",
+        ref_id: input.segment_id,
+        model: input.model,
+        vector: input.vector,
+      },
+    ]);
+    await insertLlmCall(input.project_id, {
+      id: newId(),
+      project_id: input.project_id,
+      segment_id: input.segment_id,
+      purpose: PURPOSE_EMBEDDING,
+      model: input.model,
+      prompt_tokens: input.prompt_tokens,
+      completion_tokens: 0,
+      cost_usd: input.cost_usd,
+      cache_hit: false,
+      cache_key: null,
+      request_json: stableStringify({
+        scope: "segment",
+        segment_id: input.segment_id,
+      }),
+      response_json: stableStringify({ dim: input.vector.length }),
+      created_at: Date.now(),
+    });
+  } catch {
+    // Persistence failures here are non-fatal; the next translateSegment
+    // call will simply re-embed.
+  }
+}
+

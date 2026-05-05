@@ -126,6 +126,97 @@ describe("exportProjectBundle", () => {
     expect(segs.length).toBeGreaterThan(0);
   });
 
+  it("round-trips embedding rows when present", async () => {
+    const bytes = await makeTestEpub();
+    const project = await createProject({
+      name: "Roundtrip emb",
+      source_lang: "en",
+      target_lang: "pt",
+      source_filename: "rte.epub",
+      source_bytes: bytes,
+    });
+    cleanup.push(project.id);
+    await runProjectIntake({
+      project_id: project.id,
+      source_lang: project.source_lang,
+      target_lang: project.target_lang,
+      epub_bytes: bytes,
+      source_filename: "rte.epub",
+    });
+
+    const { upsertEmbedding } = await import("@/db/repo/embeddings");
+    // Seed two vectors — one segment, one glossary entry — so we can
+    // confirm both scopes survive the export/import cycle.
+    const segs = await openProjectDb(project.id).segments.toArray();
+    const seg_id = segs[0]!.id;
+    const seg_vec = Float32Array.from([0.1, 0.2, 0.3, 0.4]);
+    await upsertEmbedding("project", project.id, {
+      scope: "segment",
+      ref_id: seg_id,
+      model: "test-model",
+      vector: seg_vec,
+    });
+    const entry_vec = Float32Array.from([0.5, 0.6, 0.7, 0.8]);
+    await upsertEmbedding("project", project.id, {
+      scope: "glossary_entry",
+      ref_id: "entry-x",
+      model: "test-model",
+      vector: entry_vec,
+    });
+
+    const { blob } = await exportProjectBundle(project.id);
+    const bundle_bytes = await blobToUint8(blob);
+    // Verify the bundle actually contains the embedding files.
+    const zip = await JSZip.loadAsync(bundle_bytes);
+    expect(zip.file("segment_embeddings.jsonl")).toBeTruthy();
+    expect(zip.file("glossary_entry_embeddings.jsonl")).toBeTruthy();
+    const seg_rows = (
+      await zip.file("segment_embeddings.jsonl")!.async("string")
+    )
+      .split("\n")
+      .filter(Boolean);
+    expect(seg_rows.length).toBe(1);
+    const ent_rows = (
+      await zip.file("glossary_entry_embeddings.jsonl")!.async("string")
+    )
+      .split("\n")
+      .filter(Boolean);
+    expect(ent_rows.length).toBe(1);
+
+    const standalone = new ArrayBuffer(bundle_bytes.byteLength);
+    new Uint8Array(standalone).set(bundle_bytes);
+    const { project_id: new_id } = await importProjectBundle(standalone);
+    cleanup.push(new_id);
+
+    const new_db = openProjectDb(new_id);
+    const seg_emb_rows = await new_db.embeddings
+      .where("scope")
+      .equals("segment")
+      .toArray();
+    const ent_emb_rows = await new_db.embeddings
+      .where("scope")
+      .equals("glossary_entry")
+      .toArray();
+    expect(seg_emb_rows).toHaveLength(1);
+    expect(ent_emb_rows).toHaveLength(1);
+    // Confirm bytewise identity of the persisted vector. The scope
+    // for segment rows is keyed by the *original* segment id, which
+    // is preserved through the import (we don't rewrite segment
+    // ids — only project_id is rewritten).
+    expect(seg_emb_rows[0]!.ref_id).toBe(seg_id);
+    expect(seg_emb_rows[0]!.model).toBe("test-model");
+    expect(seg_emb_rows[0]!.dim).toBe(4);
+    const reseg_vec = new Float32Array(
+      seg_emb_rows[0]!.vector.buffer,
+      seg_emb_rows[0]!.vector.byteOffset,
+      seg_emb_rows[0]!.vector.byteLength / 4,
+    );
+    expect(Array.from(reseg_vec)).toEqual([
+      0.1, 0.2, 0.3, 0.4,
+    ].map((n) => Math.fround(n)));
+    expect(ent_emb_rows[0]!.ref_id).toBe("entry-x");
+  });
+
   it("can re-import a bundle into a fresh project with a new id", async () => {
     const bytes = await makeTestEpub();
     const project = await createProject({

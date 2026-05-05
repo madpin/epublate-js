@@ -36,6 +36,7 @@ import {
   updateGlossaryEntry,
 } from "@/db/repo/glossary";
 import {
+  applyTargetRename,
   cascadeRetranslate,
   computeAffected,
   type CascadeCandidate,
@@ -198,13 +199,12 @@ export function EntryEditModal({
       });
       onSaved?.(entry.entry.id);
 
-      // Cascade preflight: only when the row is curator-trusted and
-      // the target text actually changed; otherwise nothing depends
-      // on the previous target term.
-      const should_cascade =
-        target_changed &&
-        (next_status === GlossaryStatus.CONFIRMED ||
-          next_status === GlossaryStatus.LOCKED);
+      // Preflight runs on any target-text change, regardless of
+      // status. The dialog now offers an in-place rename that's free
+      // and instant, so even `proposed` entries are worth checking —
+      // a proposed term that leaked into a translation should be
+      // renamed alongside the glossary entry rather than abandoned.
+      const should_cascade = target_changed;
       if (should_cascade) {
         const next_entry: GlossaryEntryWithAliases = {
           entry: {
@@ -273,8 +273,57 @@ export function EntryEditModal({
     }
   };
 
+  const onApplyRename = async (): Promise<void> => {
+    if (!entry || !pendingCascade) return;
+    if (!pendingCascade.new_target_term || !pendingCascade.prev_target_term) {
+      // Nothing to rename — fall back to skip so the curator can pick
+      // again rather than silently no-oping.
+      onSkipCascade();
+      return;
+    }
+    setBusy(true);
+    try {
+      const next_entry: GlossaryEntryWithAliases = {
+        entry: {
+          ...entry.entry,
+          target_term: pendingCascade.new_target_term,
+        },
+        source_aliases: entry.source_aliases,
+        target_aliases: entry.target_aliases,
+      };
+      const summary = await applyTargetRename({
+        project_id,
+        entry: next_entry,
+        prev_target_term: pendingCascade.prev_target_term,
+        new_target_term: pendingCascade.new_target_term,
+        candidates: pendingCascade.candidates,
+        reason: "glossary edit",
+      });
+      const parts: string[] = [];
+      parts.push(
+        `Renamed in ${summary.updated} segment${summary.updated === 1 ? "" : "s"}`,
+      );
+      if (summary.replacements > summary.updated) {
+        parts.push(`(${summary.replacements} occurrences)`);
+      }
+      if (summary.skipped > 0) {
+        parts.push(
+          `${summary.skipped} skipped — old term wasn't in the translation`,
+        );
+      }
+      toast.success(`${parts.join(" · ")}.`);
+      setPendingCascade(null);
+      onOpenChange(false);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Rename failed: ${msg}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const onSkipCascade = (): void => {
-    toast.message("Skipped re-translation cascade.");
+    toast.message("Skipped — translations left untouched.");
     setPendingCascade(null);
     onOpenChange(false);
   };
@@ -431,18 +480,43 @@ export function EntryEditModal({
 
       {pendingCascade !== null ? (
         <Dialog open onOpenChange={(o) => !o && onSkipCascade()}>
-          <DialogContent>
+          <DialogContent className="max-w-lg">
             <DialogHeader>
-              <DialogTitle>Re-translate affected segments?</DialogTitle>
+              <DialogTitle>Update affected translations?</DialogTitle>
               <DialogDescription>
                 {pendingCascade.candidates.length} segment
                 {pendingCascade.candidates.length === 1 ? "" : "s"}
-                {" "}touch this entry. Resetting them to pending lets the next
-                batch translate them with the new target term:{" "}
-                <strong>{pendingCascade.new_target_term}</strong>.
+                {" "}touch this entry. The target term changed from{" "}
+                <strong>{pendingCascade.prev_target_term ?? "—"}</strong> to{" "}
+                <strong>{pendingCascade.new_target_term ?? "—"}</strong>.
               </DialogDescription>
             </DialogHeader>
-            <DialogFooter>
+            <ul className="grid gap-3 py-2 text-sm">
+              <li className="grid gap-1 rounded-md border p-3">
+                <span className="font-medium">Apply rename (recommended)</span>
+                <span className="text-xs text-muted-foreground">
+                  Replace the old term with the new one in every affected
+                  translation. Free, instant, and keeps the surrounding
+                  prose untouched.
+                </span>
+              </li>
+              <li className="grid gap-1 rounded-md border p-3">
+                <span className="font-medium">Reset to pending</span>
+                <span className="text-xs text-muted-foreground">
+                  Drop the existing translations and let the next batch
+                  re-translate them. Slower + paid, but rephrases context
+                  that depends on the term.
+                </span>
+              </li>
+              <li className="grid gap-1 rounded-md border p-3">
+                <span className="font-medium">Skip</span>
+                <span className="text-xs text-muted-foreground">
+                  Update the glossary entry only. Existing translations
+                  keep the old term until you fix them manually.
+                </span>
+              </li>
+            </ul>
+            <DialogFooter className="gap-2">
               <Button
                 variant="outline"
                 type="button"
@@ -452,11 +526,19 @@ export function EntryEditModal({
                 Skip
               </Button>
               <Button
+                variant="outline"
                 type="button"
                 onClick={() => void onConfirmCascade()}
                 disabled={busy}
               >
                 Reset {pendingCascade.candidates.length}
+              </Button>
+              <Button
+                type="button"
+                onClick={() => void onApplyRename()}
+                disabled={busy}
+              >
+                Apply rename
               </Button>
             </DialogFooter>
           </DialogContent>

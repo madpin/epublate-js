@@ -36,6 +36,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { PossibleDuplicateProposalsCard } from "@/components/glossary/PossibleDuplicateProposalsCard";
 import { libraryDb } from "@/db/library";
 import { openProjectDb } from "@/db/dexie";
 import {
@@ -388,6 +389,8 @@ export function InboxRoute(): React.JSX.Element {
             )}
           </CardContent>
         </Card>
+
+        <PossibleDuplicateProposalsCard project_id={projectId} />
 
         <Card className="lg:col-span-2">
           <CardHeader>

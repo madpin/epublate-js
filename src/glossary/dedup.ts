@@ -22,6 +22,9 @@
  *    prefix get merged into the same group.
  */
 
+import type { EmbeddingRow } from "@/db/schema";
+import { unpackFloat32, cosine } from "@/llm/embeddings/base";
+
 import type { GlossaryEntryWithAliases } from "./models";
 
 const TRAILING_NOUN_SUFFIXES: readonly string[] = [
@@ -231,6 +234,140 @@ export function findNearDuplicates(
       return a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0;
     });
     groups.push(members);
+  }
+  return groups;
+}
+
+/* ------------------------------------------------------------------ */
+/* Embedding-based dedup (Phase 5)                                     */
+/* ------------------------------------------------------------------ */
+
+export interface EmbeddingDuplicateOptions {
+  /** Minimum cosine similarity to fold two entries into one cluster. */
+  min_similarity?: number;
+  /**
+   * When `true` (the default), only entries with the same `type` are
+   * candidates. Setting `false` allows e.g. character/place merges,
+   * which the curator may want when `type` was misclassified.
+   */
+  same_type_only?: boolean;
+}
+
+export interface EmbeddingDuplicateGroup {
+  /** "Winner-first" ordered cluster, ranked the same way as `findNearDuplicates`. */
+  members: GlossaryEntryWithAliases[];
+  /** Highest pairwise cosine inside the cluster — useful for UI surfacing. */
+  max_similarity: number;
+}
+
+/**
+ * Cluster `entries` by cosine similarity of their embedding vectors.
+ *
+ * Strategy: union-find over an O(n²) all-pairs scan. Up to ~1k
+ * proposed entries this is well below 100ms in Chrome on a Macbook;
+ * larger projects should pre-bucket by type via the `same_type_only`
+ * default before falling through.
+ *
+ * Entries without a vector for `model` are skipped silently — they
+ * fall back to the regex-based `findNearDuplicates` path.
+ *
+ * Singletons (no neighbour above `min_similarity`) are dropped, so
+ * the return value lists *only* the actual duplicate clusters.
+ */
+export function findEmbeddingDuplicates(
+  entries: readonly GlossaryEntryWithAliases[],
+  embeddings: readonly EmbeddingRow[],
+  options: EmbeddingDuplicateOptions = {},
+): EmbeddingDuplicateGroup[] {
+  const min_similarity = options.min_similarity ?? 0.92;
+  const same_type_only = options.same_type_only ?? true;
+
+  // Build ref_id → unpacked vector for the entries we actually have.
+  // `embeddings` may include rows with mixed `dim` if the curator
+  // swapped models mid-project; we drop those silently here so the
+  // dedup oracle stays robust against config flips.
+  const vec_by_id = new Map<string, Float32Array>();
+  let expected_dim: number | null = null;
+  for (const row of embeddings) {
+    if (expected_dim == null) expected_dim = row.dim;
+    else if (row.dim !== expected_dim) continue;
+    vec_by_id.set(row.ref_id, unpackFloat32(row.vector));
+  }
+
+  const eligible = entries.filter((e) => vec_by_id.has(e.entry.id));
+  if (eligible.length < 2) return [];
+
+  // Union-find — each entry id is its own root to start.
+  const parent = new Map<string, string>();
+  for (const e of eligible) parent.set(e.entry.id, e.entry.id);
+  const find = (k: string): string => {
+    let cur = k;
+    while (parent.get(cur) !== cur) {
+      const next = parent.get(cur)!;
+      parent.set(cur, parent.get(next)!);
+      cur = parent.get(cur)!;
+    }
+    return cur;
+  };
+  const union = (a: string, b: string): void => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra === rb) return;
+    if (ra < rb) parent.set(rb, ra);
+    else parent.set(ra, rb);
+  };
+
+  // Track the maximum pairwise similarity that produced each cluster
+  // root so the UI can surface "≥ 0.97" for very tight matches.
+  const max_sim = new Map<string, number>();
+
+  for (let i = 0; i < eligible.length; i++) {
+    const ei = eligible[i]!;
+    const vi = vec_by_id.get(ei.entry.id)!;
+    for (let j = i + 1; j < eligible.length; j++) {
+      const ej = eligible[j]!;
+      if (same_type_only && ei.entry.type !== ej.entry.type) continue;
+      const vj = vec_by_id.get(ej.entry.id)!;
+      const sim = cosine(vi, vj);
+      if (sim < min_similarity) continue;
+      union(ei.entry.id, ej.entry.id);
+      const root = find(ei.entry.id);
+      const prev = max_sim.get(root) ?? 0;
+      if (sim > prev) max_sim.set(root, sim);
+    }
+  }
+
+  const grouped = new Map<string, GlossaryEntryWithAliases[]>();
+  for (const e of eligible) {
+    const root = find(e.entry.id);
+    let arr = grouped.get(root);
+    if (!arr) {
+      arr = [];
+      grouped.set(root, arr);
+    }
+    arr.push(e);
+  }
+
+  const statusRankLocal: Record<string, number> = {
+    locked: 0,
+    confirmed: 1,
+    proposed: 2,
+  };
+  const groups: EmbeddingDuplicateGroup[] = [];
+  const roots = [...grouped.keys()].sort();
+  for (const root of roots) {
+    const members = grouped.get(root)!;
+    if (members.length < 2) continue;
+    members.sort((a, b) => {
+      const sa = statusRankLocal[a.entry.status] ?? 99;
+      const sb = statusRankLocal[b.entry.status] ?? 99;
+      if (sa !== sb) return sa - sb;
+      const ta = a.entry.type !== "term" ? 0 : 1;
+      const tb = b.entry.type !== "term" ? 0 : 1;
+      if (ta !== tb) return ta - tb;
+      return a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0;
+    });
+    groups.push({ members, max_similarity: max_sim.get(root) ?? 0 });
   }
   return groups;
 }

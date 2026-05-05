@@ -31,6 +31,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { EmbeddingsCard } from "@/components/settings/EmbeddingsCard";
 
 /**
  * Settings screen.
@@ -276,6 +277,8 @@ export function SettingsRoute(): React.JSX.Element {
             </div>
           </CardContent>
         </Card>
+
+        <EmbeddingsCard />
 
         <Card>
           <CardHeader>

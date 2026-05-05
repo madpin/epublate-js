@@ -192,7 +192,9 @@ erDiagram
   PROJECT_DB ||--|{ LLM_CALL : audits
   PROJECT_DB ||--|{ EVENT : streams
   PROJECT_DB ||--o{ ATTACHED_LORE : references
+  PROJECT_DB ||--o{ EMBEDDING : caches
   LORE_DB ||--|{ GLOSSARY_ENTRY : has
+  LORE_DB ||--o{ EMBEDDING : caches
   PROJECT_DB ||--|{ INTAKE_RUN : has
   INTAKE_RUN ||--o{ INTAKE_RUN_ENTRY : produces
 ```
@@ -219,8 +221,9 @@ erDiagram
 | `entity_mentions` | id, `segment_id`, `entry_id`, `[segment_id+entry_id]`        | Each (segment, glossary entry) pair the matcher recorded.                                    |
 | `llm_calls`       | id, `[project_id+cache_key]`, `purpose`, `created_at`       | Full audit row per LLM call. `cache_hit ∈ {0, 1}`.                                          |
 | `events`          | `++id`, `project_id`, `ts`, `kind`                          | Append-only structured event stream (`segment.translated`, `batch.paused`, …).               |
-| `attached_lore`   | id, `[project_id+lore_path]`                                | Which Lore Books this project pulls from, with `mode` and `priority`.                       |
-| `intake_runs`     | id, `project_id`, `kind`                                    | One row per helper-LLM intake run (book intake, chapter pre-pass, tone sniff).               |
+| `attached_lore`   | id, `[project_id+lore_path]`                                | Which Lore Books this project pulls from, with `mode` and `priority`. v2: optional `retrieval_top_k` and `retrieval_min_similarity` per attachment. |
+| `intake_runs`     | id, `project_id`, `kind`                                    | One row per helper-LLM intake run (book intake, chapter pre-pass, tone sniff, **embedding pass**). |
+| `embeddings`      | id, `[scope+ref_id+model]`, `[scope+model]`, `created_at`   | Float32 vectors (packed as `Uint8Array`), one per `(scope, ref_id, model)`. Scopes: `segment`, `glossary_entry`. |
 | `source_blobs`    | key (`"original"`)                                          | Verbatim ePub bytes the curator dropped in.                                                  |
 
 ### Status enums
@@ -252,6 +255,8 @@ stateDiagram-v2
 | Cache (across batches)               | `llm_calls` indexed by `[project_id+cache_key]`         |
 | Reader scroll position               | `localStorage` (per project; not in Dexie)              |
 | Theme / mock toggle / API key        | `epublate-library` → `ui` / `llm` singleton rows         |
+| Embedding provider config            | `epublate-library` → `llm.embedding` (per-project override in `projects.llm_overrides`) |
+| Embedding vectors (segments + entries) | `epublate-project-<id>.embeddings` and `epublate-lore-<id>.embeddings` |
 | Last-active project (for sidebar)    | `localStorage` via `useLastProjectStore`                |
 
 ---
@@ -275,9 +280,14 @@ sequenceDiagram
     Pipeline->>DB: persist segment.target_text = source<br/>status = TRANSLATED, kind = trivial
     Pipeline-->>Caller: TranslateOutcome (trivial)
   else has real text
+    opt embeddings enabled
+      Pipeline->>Pipeline: embed(segment.source_text) → segment_vec
+      Pipeline->>Pipeline: Lore-Book top-K via cosineTopK
+      Pipeline->>Pipeline: proposed-entry hints via cosineTopK
+    end
     Pipeline->>Glossary: buildConstraints + buildTargetOnlyConstraints + glossaryHash
-    Pipeline->>Pipeline: collect context window
-    Pipeline->>Pipeline: build translator messages
+    Pipeline->>Pipeline: collect context window (mode = previous | dialogue | relevant | off)
+    Pipeline->>Pipeline: build translator messages (incl. proposed-hints block)
     Pipeline->>Cache: lookup [project_id, cache_key]
     alt cache hit
       Cache-->>Pipeline: cached response_json
@@ -449,12 +459,13 @@ The glossary is what makes long-form translation tractable. There are five sub-m
 
 ### Cascade
 
-When a curator promotes a proposed entry to locked, or changes a locked entry's target term, every previously translated segment that touched the old terminology may now be wrong. `glossary/cascade.ts`:
+When a curator changes a glossary entry's target term, every previously translated segment that touched the old terminology may now be wrong. `glossary/cascade.ts` exposes a shared read-only preflight and two recovery paths the curator picks between in the EntryEditModal dialog:
 
-1. `computeAffected({ project_id, entry, prev_target_term })` reads every segment, applies `makePattern` against both source and previous target, returns the candidate list. Read-only, no side-effects.
-2. `cascadeRetranslate({ candidates, … })` runs in a single transaction: flips matching segments back to `pending`, emits `segment.cascaded` events with the prior target so history is preserved.
+1. `computeAffected({ project_id, entry, prev_target_term })` reads every translated segment, applies `makePattern` against both source and previous target, returns the candidate list. Read-only, no side-effects.
+2. `applyTargetRename({ candidates, prev_target_term, new_target_term, … })` does an **in-place substring replacement** on the target text — same Unicode-aware word-boundary regex from `makePattern`, so "rei" doesn't accidentally consume "reino". Free, instant, preserves segment status; emits `segment.renamed` + `glossary.renamed` events. Skips candidates whose target doesn't actually contain the old term (source-only matches).
+3. `cascadeRetranslate({ candidates, … })` flips matching segments back to `pending` so the next batch run re-translates them under the new term. Robust against context that depends on the term but slow + paid; emits `segment.cascaded` + `glossary.cascaded` events with the prior translation preserved as audit history.
 
-The Inbox surfaces the candidate list before commit so the curator can approve/skip.
+The dialog surfaces all three options ("Apply rename" / "Reset to pending" / "Skip") whenever target-term changes affect at least one previously translated segment — including `proposed` entries, since renaming is free even for unvetted terminology that leaked into a translation.
 
 ### Auto-propose
 
@@ -578,6 +589,69 @@ The response is a strict JSON object:
 ```
 
 `chatWithJsonFallback` requests `response_format: json_object` first; on a 400 from a permissive endpoint that doesn't support it, falls back to plain text + post-parse via `parseTranslatorResponse`.
+
+---
+
+## Embeddings
+
+A sibling of `LLMProvider` for the optional retrieval layer (default `none`, fully backward-compatible). Three concrete providers in `src/llm/embeddings/`:
+
+| Provider                | Constructor             | Backend                        | Network              | Notes                                                         |
+| ----------------------- | ----------------------- | ------------------------------ | -------------------- | ------------------------------------------------------------- |
+| `openai-compat`         | `OpenAICompatEmbeddingProvider` | `POST /v1/embeddings`  | Curator's endpoint   | Same retry/backoff/`Retry-After` helper as `OpenAICompatProvider`. |
+| `local`                 | `LocalEmbeddingProvider`        | `@xenova/transformers` | One-time HF download | Lazy-imported; default model `Xenova/multilingual-e5-small` (~120 MB), cached in browser Cache Storage. |
+| `mock`                  | `MockEmbeddingProvider`         | none                   | none                 | Deterministic SHA-256-derived vectors — used for tests + the inbox-dedup oracle. |
+
+`buildEmbeddingProvider(library, project_overrides)` (in `factory.ts`) merges the library default with the per-project override and returns a fully-instantiated provider, or `null` when embeddings are disabled. Per-project override lives inside `projects.llm_overrides` (parsed as `{ embedding: ProjectEmbeddingOverrides }`).
+
+Vectors land in a single `embeddings` Dexie store (per-project or per-Lore-Book DB), discriminated by `scope`:
+
+| Scope            | Where               | What it stores                                              | Keyed by                                              |
+| ---------------- | ------------------- | ----------------------------------------------------------- | ----------------------------------------------------- |
+| `segment`        | per-project DB      | Source-text vector for `relevant` cross-chapter context     | `[scope+ref_id+model]`                               |
+| `glossary_entry` | per-project DB      | Project-side glossary entry vector for proposed-hint retrieval | same                                              |
+| `glossary_entry` | per-Lore-Book DB    | Lore-Book entry vector for retrieval against the segment    | same                                              |
+
+The retrieval primitive is `cosineTopK(target, dbId, scope, model, vec, options)` in `db/repo/embeddings.ts` — a linear-scan ANN that's cheap up to ~50k rows per scope. Filters: `min_similarity`, `filter` (allow-list of `ref_id`s), `exclude_ref_id` (for self-similarity).
+
+Audit ledger reuses `llm_calls`: each batched embed call writes one row with `purpose = "embedding"`, `prompt_tokens = total_input_chars / 4`, `completion_tokens = 0`, and `cost_usd` from `pricing.ts`. Budget cap in `core/batch.ts` integrates from `llm_calls`, so embed costs flow through naturally.
+
+### Four feature integrations
+
+1. **Lore-Book retrieval** (`src/lore/attach.ts` + `src/lore/embeddings.ts`). Project-side glossary still goes in full; per attached Lore Book, the segment vector is matched against the Lore-Book's `glossary_entry` vectors and the top-K survivors get folded into the prompt. Per-attachment `top_k`/`min_similarity` overrides live on `attached_lore`. Falls back to flatten-everything when embeddings are disabled.
+2. **`relevant` cross-chapter context** (`src/core/pipeline.ts` `collectContextSegments`). Embed all segments at intake (the `EMBEDDING_PASS` intake-run kind handles this); when the curator picks `mode = "relevant"` in the Context-window card, retrieve top-K previously-translated segments by cosine to the current segment vector. Format identical to `previous` mode so the prompt shape is unchanged.
+3. **Proposed-entry hints** (`src/glossary/enforcer.ts` `buildProposedHints`). Today `buildConstraints` deliberately drops `proposed` entries — locking the LLM to un-vetted terms is risky. With embeddings on, `proposed` entries with cosine ≥ `min_similarity` (default 0.72) to the segment vector are retrieved, sorted deterministically by `source_term` for cache-key stability, and rendered as a separate `### Proposed terms (unvetted hints)` block in the system prompt. A 10th rule tells the translator they're soft hints, not contracts. `validateTarget` is unchanged — proposed entries still don't trigger violations.
+4. **Inbox dedup** (`src/glossary/dedup.ts` `findEmbeddingDuplicates`). Clusters of `proposed` entries with cosine ≥ 0.92 and same `type` surface in a "Possible duplicate proposals" Inbox card; one-click merge calls `mergeGlossaryEntries`.
+
+### Cache-key recipe with embeddings
+
+The retrieval results all land inside the user message; `cacheKeyForMessages` already hashes that, so cache invalidation is automatic. Two extra knobs:
+
+- The proposed-hints block sorts entries by `source_term` (then `id`) before formatting, so adding a 9th proposed entry that doesn't make the top-K won't churn the cache.
+- `request_payload.proposed_hints_used` is included in the audit ledger but **not** the cache key — it's an audit field, not a determinism input.
+
+### Bundle export
+
+`project_bundle.ts` ships at `SCHEMA_VERSION = 2`: in addition to the v1 streams, v2 bundles include `segment_embeddings.jsonl` and `glossary_entry_embeddings.jsonl`, with each `vector` re-encoded as base64. Older bundles (`schema_version = 1`) import cleanly — the embedding files are optional.
+
+### Model-change consequences and re-embed flow
+
+Embedding vectors are tied to the model that produced them: rows tagged `model = "X"` are not comparable against a query vector from `model = "Y"`, even when both use the same `dim`. The retrieval primitive `cosineTopK` already filters by `(scope, model)` so a stale row never pollutes the top-K, but that also means the curator silently loses the vectors when they switch the active model.
+
+`src/llm/embeddings/inventory.ts` exposes the curator-facing primitives that close this loop:
+
+| Function                          | Purpose                                                                                                                              |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `getProjectEmbeddingInventory`    | Per-`(scope, model)` histogram + active/stale/missing counts. Includes attached Lore Books.                                          |
+| `reembedProject`                  | Runs `runEmbeddingPass` (segments) + `embedProjectGlossaryEntriesWithProvider` against the active provider; opt-in Lore-Book pass.   |
+| `purgeStaleEmbeddings`            | Drops rows whose `model` differs from `keep_model`. Used after re-embed to reclaim quota.                                            |
+
+Two UX guard rails sit on top:
+
+1. **Settings → Embeddings** detects when `(provider, model, dim)` differs from the persisted config and shows a warning dialog before saving. Curators must click "Save anyway" — there's no silent path.
+2. **Project Settings** mirrors the dialog for the per-project override and renders `EmbeddingInventoryCard` below the override form. The card shows the live histogram (active vs stale per model), a "Re-embed everything" button (Lore-Book opt-in via checkbox to avoid rewriting vectors that other projects share), and a "Purge stale rows" button to free IndexedDB quota once the curator is sure they won't switch back.
+
+The persistence model: vectors carry `model` on each row, so the project's history is implicit — every row knows which model produced it. The `LibraryEmbeddingConfig` and `projects.llm_overrides.embedding` define the *current preference*, which is what `resolveEmbeddingConfig` returns at retrieval time.
 
 ---
 

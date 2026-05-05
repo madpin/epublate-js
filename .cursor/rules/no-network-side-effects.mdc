@@ -29,6 +29,20 @@ mode behind an explicit user opt-in **and** document the data flow in
 ## Allowed
 
 - The configured OpenAI-compatible endpoint, via `LLMProvider`.
+- The configured OpenAI-compatible **embedding** endpoint, via
+  `EmbeddingProvider` (re-uses the same base URL by default; can be
+  pointed at a separate host through Settings → Embeddings).
+- Embedding model weights from `huggingface.co/Xenova/*` after
+  explicit per-project consent (see `EmbeddingProvider`'s `local`
+  variant). Curators must click through the consent dialog once;
+  weights are cached in the browser's Cache Storage and never
+  re-fetched until they explicitly clear the cache.
+- ONNX runtime WebAssembly artifacts from
+  `cdn.jsdelivr.net/npm/@xenova/transformers/dist/*.wasm`. These are
+  the runtime that executes the locally-downloaded weights and are
+  pulled from the same source/version as the bundled npm package
+  the consent screen references. They never carry user data and
+  ride the consent gate.
 - Service-worker / vite asset fetches at build time (compile to a
   static bundle).
 - IndexedDB, localStorage, OPFS — fully local storage.
@@ -39,3 +53,4 @@ mode behind an explicit user opt-in **and** document the data flow in
 - [ ] No new `<script src=...>` tag pointing at a CDN.
 - [ ] No new dependency that auto-instruments.
 - [ ] No new analytics or telemetry imports.
+- [ ] Local embedding download paths still gate on user consent.

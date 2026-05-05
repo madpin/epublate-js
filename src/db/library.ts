@@ -19,11 +19,13 @@
 import Dexie, { type Table } from "dexie";
 
 import {
+  type LibraryEmbeddingConfig,
   type LibraryLlmConfigRow,
   type LibraryLoreBookRow,
   type LibraryProjectRow,
   type LibraryUiPrefsRow,
   type ThemeIdT,
+  DEFAULT_EMBEDDING_CONFIG,
   ThemeId,
 } from "./schema";
 
@@ -110,20 +112,42 @@ export const DEFAULT_LLM_CONFIG: LibraryLlmConfigRow = {
   organization: null,
   reasoning_effort: null,
   pricing_overrides: {},
+  embedding: DEFAULT_EMBEDDING_CONFIG,
 };
 
+/**
+ * Read the LLM singleton, layering the default embedding config onto
+ * pre-v2 rows that don't carry it. Keeps reads idempotent for the
+ * Settings UI without forcing a one-time migration write.
+ */
 export async function readLlmConfig(): Promise<LibraryLlmConfigRow> {
   const row = await libraryDb().llm.get("llm");
-  return row ?? DEFAULT_LLM_CONFIG;
+  if (!row) return DEFAULT_LLM_CONFIG;
+  return ensureEmbeddingDefaults(row);
 }
 
 export async function writeLlmConfig(
   patch: Partial<Omit<LibraryLlmConfigRow, "key">>,
 ): Promise<LibraryLlmConfigRow> {
-  const next: LibraryLlmConfigRow = { ...(await readLlmConfig()), ...patch };
+  const current = await readLlmConfig();
+  const next: LibraryLlmConfigRow = { ...current, ...patch };
+  if (patch.embedding !== undefined) {
+    next.embedding = patch.embedding;
+  } else {
+    next.embedding = current.embedding ?? DEFAULT_EMBEDDING_CONFIG;
+  }
   await libraryDb().llm.put(next);
   return next;
 }
+
+function ensureEmbeddingDefaults(
+  row: LibraryLlmConfigRow,
+): LibraryLlmConfigRow {
+  if (row.embedding) return row;
+  return { ...row, embedding: DEFAULT_EMBEDDING_CONFIG };
+}
+
+export type { LibraryEmbeddingConfig };
 
 export async function listRecentProjects(): Promise<LibraryProjectRow[]> {
   return libraryDb().projects.orderBy("opened_at").reverse().toArray();

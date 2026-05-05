@@ -141,6 +141,141 @@ export function buildTargetOnlyConstraints(
 }
 
 /**
+ * Phase 4: prompt-shape representation of a *proposed* glossary
+ * entry, retrieved by similarity rather than by exact source match.
+ *
+ * The translator treats these as **soft hints** — non-binding
+ * suggestions the model may apply when they fit the source's sense.
+ * Crucially, `validateTarget` ignores them; they never trigger a
+ * `Violation`. This matches `enforcer`'s rule: locked / confirmed
+ * are contracts, proposed are advisory.
+ */
+export interface ProposedHint {
+  source_term: string;
+  target_term: string;
+  type?: string;
+  notes?: string | null;
+  /** Cosine similarity to the segment vector at retrieval time. */
+  similarity: number;
+}
+
+export interface ProposedHintsBlock {
+  /**
+   * Pre-formatted markdown-ish block ready for the system prompt.
+   * Empty string when no hints qualified — caller should drop the
+   * whole section rather than emit an empty header.
+   */
+  block: string;
+  /**
+   * Entry ids actually included. Logged into `llm_calls.request_json`
+   * so the audit trail can answer "which proposed entries did the
+   * translator see for this segment?".
+   */
+  used_ids: string[];
+}
+
+export interface BuildProposedHintsInput {
+  /** Candidate proposed entries (caller must have already filtered to status=proposed). */
+  entries: readonly GlossaryEntryWithAliases[];
+  /**
+   * Pre-fetched cosine similarities, keyed by entry id. Callers
+   * compute these once via `cosineTopK` against the segment's vector
+   * (Phase 1 helper) and pass the map in. We separate retrieval from
+   * formatting so this module stays free of IndexedDB / async deps.
+   */
+  similarities: ReadonlyMap<string, number>;
+  /** Top-K cap. Defaults to 8 — matches the plan's documented default. */
+  top_k?: number;
+  /**
+   * Floor below which hints are dropped entirely. Defaults to 0.72;
+   * tighter than `relevant` context mode because hints are meant to
+   * be high-precision suggestions, not exhaustive callbacks.
+   */
+  min_similarity?: number;
+}
+
+const DEFAULT_HINT_TOP_K = 8;
+const DEFAULT_HINT_MIN_SIMILARITY = 0.72;
+
+/**
+ * Build the "Proposed terms (unvetted hints)" block for the
+ * translator system prompt.
+ *
+ * The block lists at most `top_k` proposed entries, sorted by
+ * descending similarity, only including those whose vector clears
+ * `min_similarity`. Entries are formatted identically to the
+ * confirmed glossary block so the LLM doesn't have to relearn the
+ * shape, but the heading and the new rule (added in
+ * `prompts/translator.ts`) make it clear they're advisory.
+ *
+ * Determinism: ties on similarity break on `entry.id` so identical
+ * inputs always produce identical output → cache key stays stable
+ * across re-runs of the same segment.
+ */
+export function buildProposedHints(
+  input: BuildProposedHintsInput,
+): ProposedHintsBlock {
+  const top_k = input.top_k ?? DEFAULT_HINT_TOP_K;
+  const min_similarity = input.min_similarity ?? DEFAULT_HINT_MIN_SIMILARITY;
+  if (top_k <= 0) return { block: "", used_ids: [] };
+
+  const ranked: Array<{
+    ent: GlossaryEntryWithAliases;
+    sim: number;
+  }> = [];
+  for (const ent of input.entries) {
+    if (ent.entry.status !== "proposed") continue;
+    if (!ent.entry.source_term) continue;
+    const sim = input.similarities.get(ent.entry.id);
+    if (sim === undefined) continue;
+    if (!Number.isFinite(sim)) continue;
+    if (sim < min_similarity) continue;
+    ranked.push({ ent, sim });
+  }
+  ranked.sort((a, b) => {
+    if (b.sim !== a.sim) return b.sim - a.sim;
+    return a.ent.entry.id < b.ent.entry.id ? -1 : 1;
+  });
+  const picked = ranked.slice(0, top_k);
+  if (!picked.length) return { block: "", used_ids: [] };
+
+  // We *intentionally* sort the rendered list by source term (not
+  // by similarity), so two segments that surface the same set of
+  // entries — even if the cosine ordering differs by a hair — emit
+  // the same block. That keeps the user_hash stable for the cache.
+  const display = [...picked].sort((a, b) => {
+    const sa = a.ent.entry.source_term ?? "";
+    const sb = b.ent.entry.source_term ?? "";
+    if (sa !== sb) return sa < sb ? -1 : 1;
+    return a.ent.entry.id < b.ent.entry.id ? -1 : 1;
+  });
+
+  const lines: string[] = [];
+  lines.push("### Proposed terms (unvetted hints)");
+  lines.push(
+    "Apply only if the source uses the term in the same sense; otherwise translate idiomatically.",
+  );
+  lines.push("");
+  for (const { ent } of display) {
+    const src = ent.entry.source_term ?? "";
+    const tgt = ent.entry.target_term;
+    const type_part = ent.entry.type ? ` (${ent.entry.type})` : "";
+    const gender_part = ent.entry.gender
+      ? ` (gender: ${ent.entry.gender})`
+      : "";
+    const notes_part = ent.entry.notes?.trim()
+      ? ` — ${ent.entry.notes.trim()}`
+      : "";
+    lines.push(`- ${src} → ${tgt}${type_part}${gender_part}${notes_part}`);
+  }
+  lines.push("");
+  return {
+    block: lines.join("\n"),
+    used_ids: picked.map((p) => p.ent.entry.id),
+  };
+}
+
+/**
  * Return every locked/confirmed glossary violation in `target_text`.
  *
  * Algorithm:

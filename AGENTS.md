@@ -36,7 +36,10 @@ A browser-only ePub translation studio that:
      (`Saito-san` ↔ `Saito-さん`).
 3. **Local-first & private.**
    - The app never makes any network call other than to the
-     user-configured LLM endpoint. No telemetry. No analytics. No CDN
+     user-configured LLM endpoint, the user-configured embedding
+     endpoint, and — *only after the curator's explicit per-project
+     consent* — the one-time download of a `Xenova/*` embedding model
+     from `huggingface.co`. No telemetry. No analytics. No CDN
      phone-homes.
    - API keys live in IndexedDB on this device. Never committed to
      export bundles unless the user opts in.
@@ -44,7 +47,10 @@ A browser-only ePub translation studio that:
    `LLMProvider` interface (`src/llm/base.ts`). Concrete providers:
    `openai_compat` (HTTP fetch with retry/backoff/`Retry-After`) and
    `mock` (deterministic, no-network). Every call is logged in
-   `llm_calls`.
+   `llm_calls`. The sibling `EmbeddingProvider` interface
+   (`src/llm/embeddings/base.ts`) covers the optional retrieval
+   layer with the same audit-ledger contract — embedding calls
+   write `purpose="embedding"` rows.
 5. **Resumability.** Every batch operation writes durable per-segment
    state. Closing the tab is harmless: opening the project again resumes
    from `pending`/`flagged` segments.
@@ -94,6 +100,12 @@ A browser-only ePub translation studio that:
 - Do **not** add analytics, error reporters, or autoupdate channels that
   call out to a third party.
 - Do **not** widen the LLM provider surface beyond OpenAI-compatible HTTP.
+  - **Exception (embeddings).** The `EmbeddingProvider`'s `local`
+    backend may download model weights from `huggingface.co/Xenova/*`
+    *after the curator clicks through the consent dialog at least
+    once per project*. The download URL must come from
+    `@xenova/transformers`'s built-in resolver — never hard-code a
+    `huggingface.co` URL elsewhere in the codebase.
 - Do **not** delete or re-key Dexie stores without a migration.
 
 ## Cursor rules

@@ -322,6 +322,130 @@ describe("Lore Book attach + projection", () => {
     );
     expect(ciri_entries).toHaveLength(1);
   });
+
+  it("resolveProjectGlossaryWithLore filters Lore Books by cosine top-K when retrieval is set", async () => {
+    const lore = await makeLore();
+    const project = await makeProject();
+
+    // Three Lore-Book entries — only one should win retrieval.
+    const wanted = await createLoreEntry(lore, {
+      source_term: "Geralt",
+      target_term: "Geralt de Rívia",
+      type: "character",
+      status: GlossaryStatus.LOCKED,
+    });
+    const decoy_a = await createLoreEntry(lore, {
+      source_term: "Triss",
+      target_term: "Triss Merigold",
+      type: "character",
+      status: GlossaryStatus.LOCKED,
+    });
+    const decoy_b = await createLoreEntry(lore, {
+      source_term: "Ciri",
+      target_term: "Cirilla",
+      type: "character",
+      status: GlossaryStatus.LOCKED,
+    });
+
+    // Inject deterministic 4-dim vectors via the embeddings repo
+    // directly so we don't depend on a provider in this test.
+    const { bulkUpsertEmbeddings } = await import("@/db/repo/embeddings");
+    const segment_vec = new Float32Array([1, 0, 0, 0]);
+    await bulkUpsertEmbeddings("lore", lore, [
+      {
+        scope: "glossary_entry",
+        ref_id: wanted.entry.id,
+        model: "test-emb",
+        vector: new Float32Array([1, 0, 0, 0]),
+      },
+      {
+        scope: "glossary_entry",
+        ref_id: decoy_a.entry.id,
+        model: "test-emb",
+        vector: new Float32Array([0, 1, 0, 0]),
+      },
+      {
+        scope: "glossary_entry",
+        ref_id: decoy_b.entry.id,
+        model: "test-emb",
+        vector: new Float32Array([0, 0, 1, 0]),
+      },
+    ]);
+
+    await attachLoreBook({
+      project_id: project,
+      lore_id: lore,
+      retrieval_top_k: 1,
+      retrieval_min_similarity: 0.5,
+    });
+
+    const own = await import("@/db/repo/glossary").then((m) =>
+      m.listGlossaryEntries(project),
+    );
+    const merged = await resolveProjectGlossaryWithLore(project, own, {
+      segment_vec,
+      embedding_model: "test-emb",
+    });
+
+    const merged_terms = merged.map((e) => e.entry.source_term).sort();
+    expect(merged_terms).toEqual(["Geralt"]);
+  });
+
+  it("resolveProjectGlossaryWithLore skips an attached Lore Book that has no embeddings yet", async () => {
+    const lore = await makeLore();
+    const project = await makeProject();
+
+    await createLoreEntry(lore, {
+      source_term: "Geralt",
+      target_term: "Geralt de Rívia",
+      type: "character",
+      status: GlossaryStatus.LOCKED,
+    });
+
+    await attachLoreBook({
+      project_id: project,
+      lore_id: lore,
+      retrieval_top_k: 8,
+    });
+
+    const own = await import("@/db/repo/glossary").then((m) =>
+      m.listGlossaryEntries(project),
+    );
+    const merged = await resolveProjectGlossaryWithLore(project, own, {
+      segment_vec: new Float32Array([1, 0, 0, 0]),
+      embedding_model: "test-emb",
+    });
+
+    expect(merged.filter((e) => e.entry.source_term === "Geralt")).toHaveLength(0);
+  });
+
+  it("resolveProjectGlossaryWithLore falls back to flat merge when retrieval_top_k <= 0", async () => {
+    const lore = await makeLore();
+    const project = await makeProject();
+
+    await createLoreEntry(lore, {
+      source_term: "Geralt",
+      target_term: "Geralt de Rívia",
+      type: "character",
+      status: GlossaryStatus.LOCKED,
+    });
+
+    await attachLoreBook({
+      project_id: project,
+      lore_id: lore,
+      retrieval_top_k: 0,
+    });
+
+    const own = await import("@/db/repo/glossary").then((m) =>
+      m.listGlossaryEntries(project),
+    );
+    const merged = await resolveProjectGlossaryWithLore(project, own, {
+      segment_vec: new Float32Array([1, 0, 0, 0]),
+      embedding_model: "test-emb",
+    });
+
+    expect(merged.filter((e) => e.entry.source_term === "Geralt")).toHaveLength(1);
+  });
 });
 
 describe("Lore Book bundle round-trip", () => {

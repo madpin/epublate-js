@@ -1,9 +1,16 @@
 import { describe, expect, it } from "vitest";
 
 import type { GlossaryEntryWithAliases } from "@/glossary/models";
-import { canonicalForm, findNearDuplicates } from "@/glossary/dedup";
+import {
+  canonicalForm,
+  findEmbeddingDuplicates,
+  findNearDuplicates,
+} from "@/glossary/dedup";
+import { packFloat32 } from "@/llm/embeddings/base";
+import type { EmbeddingRow } from "@/db/schema";
 import {
   buildConstraints,
+  buildProposedHints,
   buildTargetOnlyConstraints,
   findTargetDoubledParticles,
   glossaryHash,
@@ -224,6 +231,132 @@ describe("enforcer.buildTargetOnlyConstraints", () => {
   });
 });
 
+describe("enforcer.buildProposedHints", () => {
+  it("returns an empty block when no proposed entries qualify", () => {
+    const out = buildProposedHints({
+      entries: [
+        fakeEntry({
+          source_term: "wolf",
+          target_term: "lobo",
+          status: "confirmed",
+        }),
+      ],
+      similarities: new Map([["e-1", 0.9]]),
+    });
+    expect(out.block).toBe("");
+    expect(out.used_ids).toEqual([]);
+  });
+
+  it("filters proposed entries by min_similarity and caps at top_k", () => {
+    const high = fakeEntry({
+      id: "high",
+      source_term: "wolf",
+      target_term: "lobo",
+      status: "proposed",
+    });
+    const mid = fakeEntry({
+      id: "mid",
+      source_term: "moon",
+      target_term: "lua",
+      status: "proposed",
+    });
+    const low = fakeEntry({
+      id: "low",
+      source_term: "fog",
+      target_term: "neblina",
+      status: "proposed",
+    });
+    const sims = new Map([
+      ["high", 0.95],
+      ["mid", 0.81],
+      ["low", 0.5],
+    ]);
+    const out = buildProposedHints({
+      entries: [high, mid, low],
+      similarities: sims,
+      top_k: 2,
+      min_similarity: 0.7,
+    });
+    expect(out.used_ids.sort()).toEqual(["high", "mid"]);
+    expect(out.block).toContain("Proposed terms (unvetted hints)");
+    expect(out.block).toContain("wolf → lobo");
+    expect(out.block).toContain("moon → lua");
+    expect(out.block).not.toContain("fog");
+  });
+
+  it("never includes locked or confirmed entries even when similarity is high", () => {
+    const proposed = fakeEntry({
+      id: "p1",
+      source_term: "p",
+      target_term: "P",
+      status: "proposed",
+    });
+    const confirmed = fakeEntry({
+      id: "c1",
+      source_term: "c",
+      target_term: "C",
+      status: "confirmed",
+    });
+    const out = buildProposedHints({
+      entries: [proposed, confirmed],
+      similarities: new Map([
+        ["p1", 0.9],
+        ["c1", 0.99],
+      ]),
+    });
+    expect(out.used_ids).toEqual(["p1"]);
+    expect(out.block).not.toContain("c → C");
+  });
+
+  it("renders entries deterministically by source term so the cache key stays stable", () => {
+    const a = fakeEntry({
+      id: "a",
+      source_term: "alpha",
+      target_term: "alfa",
+      status: "proposed",
+    });
+    const b = fakeEntry({
+      id: "b",
+      source_term: "beta",
+      target_term: "beta",
+      status: "proposed",
+    });
+    const sims = new Map([
+      ["a", 0.9],
+      ["b", 0.91],
+    ]);
+    const order_a = buildProposedHints({
+      entries: [a, b],
+      similarities: sims,
+    });
+    const order_b = buildProposedHints({
+      entries: [b, a],
+      similarities: sims,
+    });
+    expect(order_a.block).toBe(order_b.block);
+    // Source-sorted: alpha appears before beta in both runs.
+    expect(order_a.block.indexOf("alpha")).toBeLessThan(
+      order_a.block.indexOf("beta"),
+    );
+  });
+
+  it("returns an empty block when top_k <= 0", () => {
+    const e = fakeEntry({
+      id: "x",
+      source_term: "foo",
+      target_term: "fu",
+      status: "proposed",
+    });
+    const out = buildProposedHints({
+      entries: [e],
+      similarities: new Map([["x", 0.99]]),
+      top_k: 0,
+    });
+    expect(out.block).toBe("");
+    expect(out.used_ids).toEqual([]);
+  });
+});
+
 describe("enforcer.validateTarget", () => {
   it("flags missing locked target as error", () => {
     const e = [
@@ -346,6 +479,179 @@ describe("dedup.findNearDuplicates", () => {
   it("drops singletons", () => {
     const a = fakeEntry({ id: "1", source_term: "Solo", target_term: "Sol" });
     expect(findNearDuplicates([a])).toEqual([]);
+  });
+});
+
+describe("dedup.findEmbeddingDuplicates", () => {
+  function vec(values: number[]): Float32Array {
+    return Float32Array.from(values);
+  }
+  function row(
+    ref_id: string,
+    values: number[],
+    model = "test-emb",
+  ): EmbeddingRow {
+    const v = vec(values);
+    return {
+      id: `r-${ref_id}`,
+      scope: "glossary_entry",
+      ref_id,
+      model,
+      dim: v.length,
+      vector: packFloat32(v),
+      created_at: 0,
+    };
+  }
+
+  it("returns an empty array when fewer than two entries have vectors", () => {
+    const a = fakeEntry({
+      id: "a",
+      source_term: "wolf",
+      target_term: "lobo",
+      status: "proposed",
+    });
+    expect(findEmbeddingDuplicates([a], [row("a", [1, 0, 0])])).toEqual([]);
+  });
+
+  it("clusters near-identical proposed entries into one group", () => {
+    const a = fakeEntry({
+      id: "a",
+      source_term: "wolf",
+      target_term: "lobo",
+      type: "character",
+      status: "proposed",
+    });
+    const b = fakeEntry({
+      id: "b",
+      source_term: "Wolf",
+      target_term: "Lobo",
+      type: "character",
+      status: "proposed",
+    });
+    const c = fakeEntry({
+      id: "c",
+      source_term: "moon",
+      target_term: "lua",
+      type: "character",
+      status: "proposed",
+    });
+    const groups = findEmbeddingDuplicates(
+      [a, b, c],
+      [
+        row("a", [1, 0, 0, 0]),
+        row("b", [0.999, 0.001, 0, 0]),
+        row("c", [0, 1, 0, 0]),
+      ],
+    );
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.members.map((m) => m.entry.id).sort()).toEqual(
+      ["a", "b"],
+    );
+    expect(groups[0]!.max_similarity).toBeGreaterThan(0.92);
+  });
+
+  it("respects same_type_only by default", () => {
+    const a = fakeEntry({
+      id: "a",
+      source_term: "tower",
+      target_term: "torre",
+      type: "place",
+      status: "proposed",
+    });
+    const b = fakeEntry({
+      id: "b",
+      source_term: "Tower",
+      target_term: "Torre",
+      type: "character",
+      status: "proposed",
+    });
+    const same_vec = [1, 0, 0, 0];
+    expect(
+      findEmbeddingDuplicates(
+        [a, b],
+        [row("a", same_vec), row("b", same_vec)],
+      ),
+    ).toEqual([]);
+    // With type-coercion off, the same pair clusters.
+    const groups = findEmbeddingDuplicates(
+      [a, b],
+      [row("a", same_vec), row("b", same_vec)],
+      { same_type_only: false },
+    );
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.members.map((m) => m.entry.id).sort()).toEqual([
+      "a",
+      "b",
+    ]);
+  });
+
+  it("ranks confirmed/locked entries ahead of proposed ones in a cluster", () => {
+    const proposed = fakeEntry({
+      id: "p",
+      source_term: "wolf",
+      target_term: "lobo",
+      type: "character",
+      status: "proposed",
+    });
+    const confirmed = fakeEntry({
+      id: "c",
+      source_term: "Wolf",
+      target_term: "Lobo",
+      type: "character",
+      status: "confirmed",
+    });
+    const groups = findEmbeddingDuplicates(
+      [proposed, confirmed],
+      [row("p", [1, 0]), row("c", [1, 0.001])],
+      { min_similarity: 0.5 },
+    );
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.members[0]!.entry.id).toBe("c");
+    expect(groups[0]!.members[1]!.entry.id).toBe("p");
+  });
+
+  it("skips entries without an embedding row", () => {
+    const a = fakeEntry({
+      id: "a",
+      source_term: "wolf",
+      target_term: "lobo",
+      type: "character",
+      status: "proposed",
+    });
+    const b = fakeEntry({
+      id: "b",
+      source_term: "wolf",
+      target_term: "lobo",
+      type: "character",
+      status: "proposed",
+    });
+    // Only `a` has a vector — no possible cluster.
+    expect(findEmbeddingDuplicates([a, b], [row("a", [1, 0])])).toEqual([]);
+  });
+
+  it("skips rows whose dim doesn't match the first observed dim", () => {
+    const a = fakeEntry({
+      id: "a",
+      source_term: "wolf",
+      target_term: "lobo",
+      type: "character",
+      status: "proposed",
+    });
+    const b = fakeEntry({
+      id: "b",
+      source_term: "Wolf",
+      target_term: "Lobo",
+      type: "character",
+      status: "proposed",
+    });
+    // `b`'s vector is the wrong dim → it gets dropped, the cluster
+    // becomes a singleton, and the function returns no groups.
+    expect(
+      findEmbeddingDuplicates(
+        [a, b],
+        [row("a", [1, 0, 0]), row("b", [1, 0])],
+      ),
+    ).toEqual([]);
   });
 });
 

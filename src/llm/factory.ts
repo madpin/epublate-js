@@ -24,12 +24,20 @@ import { OpenAICompatProvider } from "./openai_compat";
 import { readLlmConfig, writeLlmConfig } from "@/db/library";
 import type { LibraryLlmConfigRow } from "@/db/schema";
 
+import type { ProjectEmbeddingOverrides } from "./embeddings/factory";
+
 export type ProjectLlmOverrides = {
   base_url?: string | null;
   translator_model?: string | null;
   helper_model?: string | null;
   reasoning_effort?: "minimal" | "low" | "medium" | "high" | null;
   organization?: string | null;
+  /**
+   * Per-project embedding overrides. Lives inside the same
+   * `llm_overrides` JSON blob so the existing read/write plumbing
+   * works unchanged. `null` ⇒ inherit from the library config.
+   */
+  embedding?: ProjectEmbeddingOverrides | null;
 };
 
 export interface ResolvedLlmConfig {

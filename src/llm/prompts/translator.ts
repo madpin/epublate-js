@@ -133,8 +133,15 @@ Hard rules — these are not negotiable:
    words like \`"na na Europa"\` or \`"the the Senate"\`. When the
    entry HAS a leading article on both sides, treat the article as
    part of the canonical spelling and do not add another one.
+10. The "Proposed terms (unvetted hints)" block, when present,
+    lists curator-uncurated suggestions surfaced for this segment by
+    semantic similarity. Apply them only when they fit the source's
+    meaning and the target audience; you may diverge if a better
+    translation exists in this context. **Do NOT include a proposed
+    term in \`used_entries\`** — that field is for locked / confirmed
+    entries only.
 
-{language_notes_block}{style_guide_block}{chapter_notes_block}{glossary_block}{target_only_block}{context_block}Respond with a single JSON object and nothing else:
+{language_notes_block}{style_guide_block}{chapter_notes_block}{glossary_block}{target_only_block}{proposed_hints_block}{context_block}Respond with a single JSON object and nothing else:
 
 {
   "target": "<translated text with placeholders preserved>",
@@ -606,6 +613,12 @@ export interface BuildTranslatorMessagesInput {
   glossary?: readonly GlossaryConstraint[];
   target_only_glossary?: readonly TargetOnlyConstraint[];
   context?: readonly ContextSegment[];
+  /**
+   * Phase 4: pre-formatted "proposed terms (unvetted hints)" block.
+   * Built upstream by `buildProposedHints`. Pass an empty string (or
+   * omit) to drop the section entirely.
+   */
+  proposed_hints_block?: string;
 }
 
 export function buildTranslatorMessages(
@@ -629,6 +642,12 @@ export function buildTranslatorMessages(
     input.target_lang,
   );
   const context_block = formatContextBlock(input.context ?? []);
+  // Proposed-hints block is pre-formatted by `buildProposedHints`;
+  // we just append a trailing blank line so the prompt sections
+  // separate cleanly. An empty input collapses the entire section.
+  const proposed_hints_block = input.proposed_hints_block?.trim()
+    ? `${input.proposed_hints_block.trim()}\n\n`
+    : "";
 
   const system_content = SYSTEM_PROMPT_TEMPLATE.replace(
     "{source_lang}",
@@ -640,6 +659,7 @@ export function buildTranslatorMessages(
     .replace("{glossary_block}", glossary_block)
     .replace("{target_only_block}", target_only_block)
     .replace("{language_notes_block}", language_notes_block)
+    .replace("{proposed_hints_block}", proposed_hints_block)
     .replace("{context_block}", context_block);
 
   return [

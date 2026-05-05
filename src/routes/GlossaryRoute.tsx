@@ -23,6 +23,7 @@ import { Link, useParams } from "react-router-dom";
 import { useLiveQuery } from "dexie-react-hooks";
 import {
   ArrowLeft,
+  CheckCircle2,
   ChevronDown,
   ChevronUp,
   ChevronsUpDown,
@@ -30,8 +31,10 @@ import {
   FileJson,
   FileText,
   Filter,
+  Lock,
   Plus,
   RefreshCw,
+  RotateCcw,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -47,6 +50,7 @@ import {
   deleteGlossaryEntry,
   listGlossaryEntries,
   listGlossaryRevisions,
+  updateGlossaryEntry,
   type MentionCounts,
 } from "@/db/repo/glossary";
 import { findIntakeRunForEntry } from "@/db/repo/intake";
@@ -187,6 +191,32 @@ export function GlossaryRoute(): React.JSX.Element {
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       toast.error(`Delete failed: ${msg}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onChangeStatus = async (
+    ent: GlossaryEntryWithAliases,
+    next: GlossaryStatusT,
+  ): Promise<void> => {
+    if (ent.entry.status === next) return;
+    setBusy(true);
+    try {
+      await updateGlossaryEntry(projectId, ent.entry.id, {
+        status: next,
+        reason: `glossary: ${ent.entry.status} -> ${next}`,
+      });
+      const verb =
+        next === GlossaryStatus.CONFIRMED
+          ? "Approved"
+          : next === GlossaryStatus.LOCKED
+            ? "Locked"
+            : "Reverted to proposed";
+      toast.success(`${verb}: ${ent.entry.source_term ?? ent.entry.target_term}`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Status update failed: ${msg}`);
     } finally {
       setBusy(false);
     }
@@ -390,12 +420,14 @@ export function GlossaryRoute(): React.JSX.Element {
           entry={selected}
           onEdit={onEdit}
           onDelete={onDelete}
+          onChangeStatus={onChangeStatus}
           onShowOccurrences={() => setOccurrencesOpen(true)}
           mention_count={
             selected
               ? mention_counts?.[selected.entry.id]?.mentions ?? 0
               : 0
           }
+          busy={busy}
         />
       </div>
 
@@ -708,8 +740,13 @@ interface DetailPaneProps {
   entry: GlossaryEntryWithAliases | null;
   onEdit(ent: GlossaryEntryWithAliases): void;
   onDelete(ent: GlossaryEntryWithAliases): void;
+  onChangeStatus(
+    ent: GlossaryEntryWithAliases,
+    next: GlossaryStatusT,
+  ): Promise<void>;
   onShowOccurrences(): void;
   mention_count: number;
+  busy: boolean;
 }
 
 function DetailPane({
@@ -717,8 +754,10 @@ function DetailPane({
   entry,
   onEdit,
   onDelete,
+  onChangeStatus,
   onShowOccurrences,
   mention_count,
+  busy,
 }: DetailPaneProps): React.JSX.Element {
   const revisions = useLiveQuery(
     async () => {
@@ -785,10 +824,70 @@ function DetailPane({
         <Button size="sm" onClick={() => onEdit(entry)}>
           Edit
         </Button>
+        {e.status === GlossaryStatus.PROPOSED ? (
+          <>
+            <Button
+              size="sm"
+              variant="default"
+              onClick={() =>
+                void onChangeStatus(entry, GlossaryStatus.CONFIRMED)
+              }
+              disabled={busy}
+              title="Promote this proposal to a confirmed glossary entry"
+            >
+              <CheckCircle2 className="size-3.5" /> Approve
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void onChangeStatus(entry, GlossaryStatus.LOCKED)}
+              disabled={busy}
+              title="Approve and lock — translations will hard-fail on a mismatch"
+            >
+              <Lock className="size-3.5" /> Approve & lock
+            </Button>
+          </>
+        ) : null}
+        {e.status === GlossaryStatus.CONFIRMED ? (
+          <>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void onChangeStatus(entry, GlossaryStatus.LOCKED)}
+              disabled={busy}
+              title="Lock — translations will hard-fail on a mismatch"
+            >
+              <Lock className="size-3.5" /> Lock
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() =>
+                void onChangeStatus(entry, GlossaryStatus.PROPOSED)
+              }
+              disabled={busy}
+              title="Demote back to proposed (kept as a soft hint)"
+            >
+              <RotateCcw className="size-3.5" /> Revert
+            </Button>
+          </>
+        ) : null}
+        {e.status === GlossaryStatus.LOCKED ? (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void onChangeStatus(entry, GlossaryStatus.CONFIRMED)}
+            disabled={busy}
+            title="Unlock — translations will keep using the term but won't fail"
+          >
+            <RotateCcw className="size-3.5" /> Unlock
+          </Button>
+        ) : null}
         <Button
           size="sm"
           variant="outline"
           onClick={() => onDelete(entry)}
+          disabled={busy}
         >
           <Trash2 className="size-3.5" /> Delete
         </Button>

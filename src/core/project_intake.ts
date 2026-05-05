@@ -27,6 +27,12 @@ export interface IntakeResult {
   segments: number;
   duration_ms: number;
   cover_extracted: boolean;
+  /**
+   * Number of segments embedded by the optional Phase 3 background
+   * pass. `null` means the pass was not run (no embedding provider
+   * configured / disabled). Phase 3.
+   */
+  embedded_segments: number | null;
 }
 
 /**
@@ -46,6 +52,27 @@ export async function runProjectIntake(input: {
   source_filename?: string;
   /** Token cap per segment; long blocks split at sentence boundaries. */
   max_tokens?: number;
+  /**
+   * When set, runs `runEmbeddingPass` immediately after segmentation
+   * so every newly-imported segment is embedded before the curator
+   * starts translating. Best-effort: failures fall back to embedding
+   * lazily during translation. Phase 3.
+   *
+   * The caller is responsible for resolving the active provider via
+   * `buildEmbeddingProvider` (Settings + project overrides) and
+   * passing it through here. Skipping this option preserves the
+   * legacy, fully-offline intake.
+   */
+  embedding_pass?: {
+    /** Active provider built from Settings + overrides. */
+    provider: import("@/llm/embeddings/base").EmbeddingProvider;
+    /** Override per-batch size for tests. */
+    batch_size_override?: number | null;
+    /** Optional progress callback for the Intake Runs screen. */
+    on_progress?: (info: import("@/core/embedding_pass").EmbeddingPassProgress) => void;
+    /** Cancellation hook plumbed through to the provider. */
+    signal?: AbortSignal;
+  } | null;
 }): Promise<IntakeResult> {
   const start = Date.now();
   const adapter = new EpubAdapter();
@@ -120,10 +147,35 @@ export async function runProjectIntake(input: {
     cover_extracted,
   });
 
+  // Phase 3: opportunistic background embedding pass. Runs only if
+  // the caller supplied a provider — keeps intake fully offline by
+  // default. We swallow per-pass failures: a half-embedded project is
+  // perfectly usable (translation lazily fills the gaps).
+  let embedded_segments: number | null = null;
+  if (input.embedding_pass && all_segments.length > 0) {
+    try {
+      const { runEmbeddingPass } = await import("@/core/embedding_pass");
+      const summary = await runEmbeddingPass(
+        input.project_id,
+        input.embedding_pass.provider,
+        {
+          batch_size_override: input.embedding_pass.batch_size_override,
+          on_progress: input.embedding_pass.on_progress,
+          signal: input.embedding_pass.signal,
+        },
+      );
+      embedded_segments = summary.embedded;
+    } catch {
+      // Best-effort — embedding pass failures don't sink intake.
+      embedded_segments = null;
+    }
+  }
+
   return {
     chapters: chapter_count,
     segments: all_segments.length,
     duration_ms,
     cover_extracted,
+    embedded_segments,
   };
 }

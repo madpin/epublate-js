@@ -85,8 +85,23 @@ const DEFAULTS: Record<string, ModelPrice> = {
   "qwen3-max": { input_per_mtok: 1.6, output_per_mtok: 6.4 },
   "qwen3-coder-plus": { input_per_mtok: 1.0, output_per_mtok: 5.0 },
   "qwen2.5-72b": { input_per_mtok: 0.9, output_per_mtok: 0.9 },
+  // OpenAI · Embeddings (input-only; the providers always report 0
+  // completion tokens, so `output_per_mtok` here is informational).
+  "text-embedding-3-small": { input_per_mtok: 0.02, output_per_mtok: 0.0 },
+  "text-embedding-3-large": { input_per_mtok: 0.13, output_per_mtok: 0.0 },
+  "text-embedding-ada-002": { input_per_mtok: 0.1, output_per_mtok: 0.0 },
+  // Voyage AI multilingual embeddings (representative third-party).
+  "voyage-3": { input_per_mtok: 0.06, output_per_mtok: 0.0 },
+  "voyage-3-lite": { input_per_mtok: 0.02, output_per_mtok: 0.0 },
+  // Cohere multilingual embeddings.
+  "embed-multilingual-v3.0": { input_per_mtok: 0.1, output_per_mtok: 0.0 },
+  // Local `@xenova/transformers` checkpoints — always free.
+  "Xenova/multilingual-e5-small": { input_per_mtok: 0.0, output_per_mtok: 0.0 },
+  "Xenova/multilingual-e5-base": { input_per_mtok: 0.0, output_per_mtok: 0.0 },
+  "Xenova/all-MiniLM-L6-v2": { input_per_mtok: 0.0, output_per_mtok: 0.0 },
   // Test sentinel.
   mock: { input_per_mtok: 0.0, output_per_mtok: 0.0 },
+  "mock-embed": { input_per_mtok: 0.0, output_per_mtok: 0.0 },
 };
 
 const UNKNOWN: ModelPrice = { input_per_mtok: 0, output_per_mtok: 0 };

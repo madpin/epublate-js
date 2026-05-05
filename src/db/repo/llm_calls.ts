@@ -89,3 +89,24 @@ export async function recentLlmCalls(
     .sortBy("created_at");
   return rows.slice(0, limit);
 }
+
+/**
+ * Sum cached + uncached cost across all `llm_calls` rows whose
+ * `purpose` matches. Used by the Embeddings card to surface
+ * "embedding spend so far" alongside the existing translator spend.
+ */
+export async function sumLlmCallCostByPurpose(
+  projectId: string,
+  purpose: string,
+): Promise<number> {
+  const db = openProjectDb(projectId);
+  let total = 0;
+  await db.llm_calls
+    .where("project_id")
+    .equals(projectId)
+    .each((row) => {
+      if (row.purpose !== purpose) return;
+      if (typeof row.cost_usd === "number") total += row.cost_usd;
+    });
+  return total;
+}

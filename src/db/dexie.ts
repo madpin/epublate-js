@@ -100,6 +100,16 @@ export class ProjectDb extends Dexie {
       intake_run_entries: "[intake_run_id+entry_id], intake_run_id, entry_id",
       source_blobs: "key",
     });
+    // v2: Embeddings retrieval layer. Adds the `[scope+model]` index
+    // so the cosine-top-K helper iterates a single scope (e.g. all
+    // segment embeddings for a given model) without a full table
+    // scan, plus a `created_at` index for incremental backfill. The
+    // shape is non-destructive: existing rows missing `created_at`
+    // are surfaced as `undefined` and treated as legacy entries.
+    this.version(2).stores({
+      embeddings:
+        "id, scope, ref_id, model, [scope+ref_id+model], [scope+model], created_at",
+    });
   }
 }
 

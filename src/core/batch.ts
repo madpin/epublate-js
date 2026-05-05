@@ -28,12 +28,20 @@
  * batch on a populated cache without paying a second time.
  */
 
-import { translateSegment, type TranslateOutcome } from "@/core/pipeline";
+import {
+  translateSegment,
+  type LoreRetrievalOptions,
+  type TranslateOutcome,
+} from "@/core/pipeline";
 import { runPrePass, type IntakeOptions } from "@/core/extractor";
 import { listGlossaryEntries } from "@/db/repo/glossary";
 import { rowToSegment } from "@/db/repo/segments";
 import { openProjectDb } from "@/db/dexie";
-import { libraryDb } from "@/db/library";
+import { libraryDb, readLlmConfig } from "@/db/library";
+import {
+  buildEmbeddingProvider,
+  type ProjectEmbeddingOverrides,
+} from "@/llm/embeddings/factory";
 import { resolveProjectGlossaryWithLore } from "@/lore/attach";
 import { nowMs } from "@/lib/time";
 import { type LLMProvider } from "@/llm/base";
@@ -216,20 +224,52 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
   const pending =
     input.segments ?? (await selectPending(project_id, options.chapter_ids ?? null));
 
+  // Phase 2: try to build an embedding provider. When one is
+  // available we keep the project-side glossary unmerged and let the
+  // pipeline retrieve top-K Lore-Book entries per segment. When the
+  // provider is "none" / unavailable we keep the legacy v1 behaviour
+  // of flattening every attached Lore Book into the prompt.
+  let lore_retrieval: LoreRetrievalOptions | null = null;
+  try {
+    const library = await readLlmConfig();
+    let project_emb_overrides: ProjectEmbeddingOverrides | null = null;
+    if (detail.llm_overrides) {
+      try {
+        const parsed = JSON.parse(detail.llm_overrides) as {
+          embedding?: ProjectEmbeddingOverrides | null;
+        };
+        project_emb_overrides = parsed.embedding ?? null;
+      } catch {
+        project_emb_overrides = null;
+      }
+    }
+    const built = await buildEmbeddingProvider({
+      configOverride: library,
+      overrides: project_emb_overrides,
+    });
+    if (built.provider) {
+      lore_retrieval = { provider: built.provider };
+    }
+  } catch {
+    // Embedding builder failures fall back to the legacy merge.
+    lore_retrieval = null;
+  }
+
   // Glossary state: capture once at start. Reading it on each segment
   // would be defensible too, but the curator's expectation is "this
   // batch uses the glossary as it was when I clicked Run" — and a
   // mid-batch edit triggers the cascade flow, which resets affected
   // segments to pending anyway.
-  let glossary_state: Awaited<ReturnType<typeof listGlossaryEntries>> =
+  let project_glossary_state: Awaited<ReturnType<typeof listGlossaryEntries>> =
     (input.glossary_state as Awaited<ReturnType<typeof listGlossaryEntries>>) ??
     (await listGlossaryEntries(project_id));
-  // Merge attached Lore-Book entries: project entries always win,
-  // higher-priority Lore Books take precedence over lower-priority.
-  glossary_state = await resolveProjectGlossaryWithLore(
-    project_id,
-    glossary_state,
-  );
+  // When no embedding provider is available we still flatten
+  // attached Lore Books into the prompt up front (legacy v1).
+  // Otherwise the pipeline merges per-segment via cosineTopK.
+  let glossary_state: Awaited<ReturnType<typeof listGlossaryEntries>> =
+    lore_retrieval
+      ? project_glossary_state
+      : await resolveProjectGlossaryWithLore(project_id, project_glossary_state);
 
   const summary = createSummary();
   summary.total = pending.length;
@@ -294,12 +334,16 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
       }
     }
     if (!paused && !cancelled) {
-      // Pre-pass may have promoted new entries; refresh the snapshot
-      // and re-merge attached Lore-Book entries.
-      glossary_state = await resolveProjectGlossaryWithLore(
-        project_id,
-        await listGlossaryEntries(project_id),
-      );
+      // Pre-pass may have promoted new entries; refresh the snapshot.
+      // Whether we re-merge with Lore Books here depends on whether
+      // we're letting the pipeline do per-segment retrieval.
+      project_glossary_state = await listGlossaryEntries(project_id);
+      glossary_state = lore_retrieval
+        ? project_glossary_state
+        : await resolveProjectGlossaryWithLore(
+            project_id,
+            project_glossary_state,
+          );
     }
   }
 
@@ -348,6 +392,14 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
             bypass_cache: options.bypass_cache,
             reasoning_effort: options.reasoning_effort ?? null,
             glossary_state: glossary_state,
+            lore_retrieval,
+            // Phase 3: pass the same provider so `relevant` context
+            // mode works when the curator hasn't attached a Lore
+            // Book. The pipeline only embeds when a request actually
+            // needs the vector (lore-retrieval and/or relevant
+            // context), so this stays a no-op for `previous` /
+            // `dialogue` modes.
+            embedding_provider: lore_retrieval?.provider ?? null,
             signal,
           },
         });

@@ -17,6 +17,12 @@
  *     `intake_runs.jsonl`,
  *     `intake_run_entries.jsonl`,
  *     `attached_lore.jsonl`.
+ *   - **v2 only:** `segment_embeddings.jsonl` and
+ *     `glossary_entry_embeddings.jsonl` — embedding vectors for
+ *     `scope = "segment"` and `scope = "glossary_entry"` rows
+ *     respectively, with `vector` re-encoded as base64. Older
+ *     bundles omit these files; importers must treat them as
+ *     optional.
  *
  * The bundle is intentionally self-contained: re-importing it on a
  * fresh device must reconstitute the entire per-project state byte-
@@ -36,6 +42,7 @@ import { nowMs } from "@/lib/time";
 import {
   type AttachedLoreRow,
   type ChapterRow,
+  type EmbeddingRow,
   type EntityMentionRow,
   type EventRow,
   type GlossaryAliasRow,
@@ -51,7 +58,12 @@ import {
   type SegmentRow,
 } from "@/db/schema";
 
-const SCHEMA_VERSION = 1;
+/**
+ * v1 → v2 bumped for the Phase 1 embedding tables. v2 bundles add
+ * two new JSONL streams; v1 bundles continue to import cleanly via
+ * the optional-file path in `importProjectBundle`.
+ */
+const SCHEMA_VERSION = 2;
 
 interface BundleManifest {
   schema_version: number;
@@ -63,6 +75,73 @@ interface BundleManifest {
 
 function jsonl(rows: readonly unknown[]): string {
   return rows.map((row) => JSON.stringify(row)).join("\n");
+}
+
+/**
+ * Re-encode an embedding row's `vector` (a `Uint8Array` view of the
+ * underlying `Float32Array` byte buffer) as base64 so it survives a
+ * `JSON.stringify` round-trip. Mirrors `decodeEmbeddingForImport`.
+ */
+function encodeEmbeddingForExport(row: EmbeddingRow): {
+  id: string;
+  scope: EmbeddingRow["scope"];
+  ref_id: string;
+  model: string;
+  dim: number;
+  vector_b64: string;
+  created_at: number;
+} {
+  const u8 = row.vector;
+  let s = "";
+  for (let i = 0; i < u8.length; i++) {
+    s += String.fromCharCode(u8[i]!);
+  }
+  const vector_b64 = (
+    typeof btoa === "function"
+      ? btoa(s)
+      : Buffer.from(u8).toString("base64")
+  );
+  return {
+    id: row.id,
+    scope: row.scope,
+    ref_id: row.ref_id,
+    model: row.model,
+    dim: row.dim,
+    vector_b64,
+    created_at: row.created_at,
+  };
+}
+
+/**
+ * Inverse of `encodeEmbeddingForExport`. Returns a fresh
+ * `EmbeddingRow` ready for `db.embeddings.put`.
+ */
+function decodeEmbeddingForImport(
+  raw: {
+    id: string;
+    scope: EmbeddingRow["scope"];
+    ref_id: string;
+    model: string;
+    dim: number;
+    vector_b64: string;
+    created_at: number;
+  },
+): EmbeddingRow {
+  const bin =
+    typeof atob === "function"
+      ? atob(raw.vector_b64)
+      : Buffer.from(raw.vector_b64, "base64").toString("binary");
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return {
+    id: raw.id,
+    scope: raw.scope,
+    ref_id: raw.ref_id,
+    model: raw.model,
+    dim: raw.dim,
+    vector: u8,
+    created_at: raw.created_at,
+  };
 }
 
 export async function exportProjectBundle(
@@ -96,6 +175,7 @@ export async function exportProjectBundle(
     attached_lore,
     lore_meta,
     lore_sources,
+    embeddings,
   ] = await Promise.all([
     db.chapters.toArray(),
     db.segments.toArray(),
@@ -110,7 +190,19 @@ export async function exportProjectBundle(
     db.attached_lore.toArray(),
     db.lore_meta.toArray(),
     db.lore_sources.toArray(),
+    db.embeddings.toArray(),
   ]);
+
+  // Split by `scope` so importers on older schemas can still parse
+  // the segment / glossary streams independently. Lore-Book scope
+  // (`glossary_entry` originating from a separate Lore DB) doesn't
+  // live in the project DB, so there's nothing to write here for it.
+  const segment_embeddings = embeddings
+    .filter((e) => e.scope === "segment")
+    .map(encodeEmbeddingForExport);
+  const glossary_entry_embeddings = embeddings
+    .filter((e) => e.scope === "glossary_entry")
+    .map(encodeEmbeddingForExport);
 
   const manifest: BundleManifest = {
     schema_version: SCHEMA_VERSION,
@@ -158,6 +250,15 @@ export async function exportProjectBundle(
   zip.file("attached_lore.jsonl", jsonl(attached_lore));
   zip.file("lore_meta.jsonl", jsonl(lore_meta));
   zip.file("lore_sources.jsonl", jsonl(lore_sources));
+  // v2 — embedding artifacts. We always emit the files (even when
+  // empty) so importers can detect "this bundle was exported by a
+  // v2-aware build" by checking the manifest version, not by file
+  // presence.
+  zip.file("segment_embeddings.jsonl", jsonl(segment_embeddings));
+  zip.file(
+    "glossary_entry_embeddings.jsonl",
+    jsonl(glossary_entry_embeddings),
+  );
 
   const blob = await zip.generateAsync({
     type: "blob",
@@ -278,6 +379,37 @@ export async function importProjectBundle(
     await readJsonl<LoreSourceRow>(zip, "lore_sources.jsonl"),
     { project_id: new_project_id },
   );
+
+  // Embeddings are optional — v1 bundles don't include them, and v2
+  // bundles for projects with `embedding_provider = "none"` will
+  // emit empty files. We do not rewrite the `id` because the
+  // `[scope+ref_id+model]` index is the actual uniqueness contract;
+  // collisions can't happen across two imported bundles since the
+  // `ref_id` either points at a freshly imported segment / entry or
+  // gets dropped silently when the DB enforces foreign-key-shape
+  // constraints.
+  const raw_segment_embeddings = await readJsonl<{
+    id: string;
+    scope: EmbeddingRow["scope"];
+    ref_id: string;
+    model: string;
+    dim: number;
+    vector_b64: string;
+    created_at: number;
+  }>(zip, "segment_embeddings.jsonl");
+  const raw_glossary_entry_embeddings = await readJsonl<{
+    id: string;
+    scope: EmbeddingRow["scope"];
+    ref_id: string;
+    model: string;
+    dim: number;
+    vector_b64: string;
+    created_at: number;
+  }>(zip, "glossary_entry_embeddings.jsonl");
+  const embedding_rows: EmbeddingRow[] = [
+    ...raw_segment_embeddings.map(decodeEmbeddingForImport),
+    ...raw_glossary_entry_embeddings.map(decodeEmbeddingForImport),
+  ];
   const stripped_events = event_rows.map((row) => {
     const { id: _id, ...rest } = row;
     return { ...rest, project_id: new_project_id };
@@ -302,6 +434,7 @@ export async function importProjectBundle(
       db.lore_meta,
       db.lore_sources,
       db.source_blobs,
+      db.embeddings,
     ],
     async () => {
       await db.projects.put(new_project);
@@ -330,6 +463,7 @@ export async function importProjectBundle(
         await db.attached_lore.bulkPut(attached_lore_rows);
       if (lore_meta_rows.length > 0) await db.lore_meta.bulkPut(lore_meta_rows);
       if (lore_source_rows.length > 0) await db.lore_sources.bulkPut(lore_source_rows);
+      if (embedding_rows.length > 0) await db.embeddings.bulkPut(embedding_rows);
     },
   );
 

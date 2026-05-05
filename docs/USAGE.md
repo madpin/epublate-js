@@ -91,6 +91,38 @@ Click **Test connection** before kicking off any work. The button performs a 1-t
 
 If you don't have an LLM yet, append `?mock=1` to any URL or toggle **Mock LLM mode** in Settings. The mock provider returns deterministic placeholders so the entire UI works without network access.
 
+### Embeddings (optional, off by default)
+
+![Settings → Embeddings card with the provider dropdown showing "none / openai-compat / local"](screenshots/12b-embeddings-card.png)
+
+Below the LLM card sits the **Embeddings** card. It powers four features:
+
+- **Lore-Book retrieval.** Attach a 5,000-entry series bible without ballooning every prompt — only the entries semantically relevant to the current segment make it through.
+- **`Relevant` cross-chapter context mode.** See above; requires this toggle to be on.
+- **Proposed-entry hints.** Translator-proposed glossary entries (status `proposed`) are dropped from the constraints block by design — but with embeddings on, they're rendered as a separate `### Proposed terms (unvetted hints)` block when the cosine similarity is above the threshold. Hints, never contracts.
+- **Inbox dedup.** A "Possible duplicate proposals" card surfaces clusters of `proposed` entries with cosine ≥ 0.92 and the same `type`, with a one-click merge.
+
+Three providers:
+
+| Provider        | Network                                | Storage           | Notes                                                                 |
+| --------------- | --------------------------------------- | ----------------- | --------------------------------------------------------------------- |
+| `none` (default)| —                                       | —                 | Embeddings disabled; everything else works as before.                |
+| `openai-compat` | Curator's existing endpoint             | ~6 KB / vector    | Defaults to `text-embedding-3-small` (1536-dim). Can point at a different `base_url` if you want to embed locally and chat remotely. |
+| `local`         | One-time `huggingface.co/Xenova/*` pull | ~1.5 KB / vector  | Uses `@xenova/transformers`; default model `Xenova/multilingual-e5-small` (~120 MB, 384-dim). After the first download the model is cached in your browser's Cache Storage and stays offline. The picker is greyed with a "Download required" pill until you click through the consent dialog once. |
+
+Turning embeddings on offers an opt-in backfill: "Embed all 8,432 segments + 184 glossary entries (estimated cost: $0.04)?" — runs as a normal background batch with cancel + resume. The cost is recorded as `purpose = "embedding"` in the LLM activity ledger.
+
+#### Switching embedding models
+
+Vectors are model-specific — rows produced by `voyage-3.5` (1024-dim) cannot be ranked against a query from `text-embedding-3-small` (1536-dim). The retrieval primitive silently filters mismatched rows, so the practical effect of switching models is "the project's embedding work disappears until you re-embed."
+
+epublate doesn't pretend this isn't happening:
+
+- **Save-time warning.** Changing provider, model, or dim in either Settings → Embeddings (library default) or Project Settings → Embeddings (per-project override) pops a confirm dialog with a side-by-side diff. Click _Save anyway_ to proceed.
+- **Per-project inventory card.** Project Settings now renders an **Embedding inventory** card with a histogram of `(scope, model)` rows: segments, project glossary, every attached Lore Book. Active rows light up green; rows under non-active models are flagged grey/struck-through as "stale".
+- **Re-embed everything.** A one-click action that re-runs the intake-style embedding pass plus the project glossary embed under the active provider's model. Lore Books are opt-in via a checkbox because their vectors are shared across every project that has them attached.
+- **Purge stale rows.** A second action that drops every project-DB row whose `model` differs from the active one. Useful once the curator is sure they won't switch back; a future re-embed re-creates them at the cost of fresh provider calls.
+
 ---
 
 ## Creating your first project
@@ -233,9 +265,15 @@ Where entries come from:
 
 When the same entity appears as multiple proposed entries (e.g. "Anne", "Anne Elliot", "Lady Anne"), the **Cleanup duplicates** action surfaces a merge confirmation modal so you can collapse them into one entry with the union of aliases.
 
-### Cascade re-translation
+### Updating the target term in existing translations
 
-Editing a locked entry's target term marks every segment whose source matched the old form as `pending` and resets their cache key, so the next batch retranslates them with the new spelling. The Inbox shows the cascade scope before it commits.
+Editing an entry's target term opens a follow-up dialog that asks how to handle the previously translated segments that referenced the old form. Three choices:
+
+- **Apply rename (recommended).** Substring-replaces the old target term with the new one in every matching translation, using a Unicode-aware word boundary so "rei" can't consume "reino". Free, instant, keeps the surrounding prose untouched. Segment status is preserved — already-approved rows stay approved, just with the term fixed. Best for simple terminology swaps ("feiticeiro" → "mago").
+- **Reset to pending.** Drops the existing translations and flips them back to `pending` so the next batch retranslates them under the new term. Slower and costs LLM tokens, but reshapes context that depends on the term (e.g. "wizard" → "sorcerer" when the surrounding sentence relies on the old connotation). Original target text is preserved in `segment.cascaded` events for the audit log.
+- **Skip.** Update the glossary only; leave the translations alone. Useful when the change is cosmetic (notes, gender) and shouldn't propagate.
+
+The dialog appears for any status (proposed / confirmed / locked) when the rename would actually affect a translated segment — proposed terms that leaked into a translation can be renamed in place at zero cost.
 
 ---
 
@@ -263,11 +301,17 @@ The new dedicated Project Settings screen consolidates every per-project knob in
 
 1. **Identity** — rename the project (kept in sync with the library projection so the recents list updates immediately). Read-only metadata: source filename, project id, languages, original size.
 2. **Style** — pick a preset or write a custom guide. Editing the guide invalidates the cache for this project.
-3. **Context window** — *new in this release*. Inject the previous N segments of the same chapter into the translator prompt as read-only context. Big windows hold tone / pronoun / reference consistency across paragraphs but cost extra prompt tokens. Most curators land between **2 and 6 segments**. Set both `Max segments` and `Max characters` to `0` to disable context entirely.
+3. **Context window** — Inject the previous N segments of the same chapter into the translator prompt as read-only context. Big windows hold tone / pronoun / reference consistency across paragraphs but cost extra prompt tokens. Most curators land between **2 and 6 segments**. Set both `Max segments` and `Max characters` to `0` to disable context entirely.
+   - **Modes.** `Off`, `Previous` (default), `Dialogue`, **`Relevant`** (cross-chapter top-K by cosine similarity — requires an embedding provider).
+   - When **Relevant** is selected, a sub-control for **Minimum cosine similarity** (default `0.65`) appears alongside `Max segments`. The pipeline embeds the current segment, ranks every previously translated/approved segment in the project against it, drops anything below the threshold, and feeds the top-K survivors to the translator in the same shape as `Previous` mode. See the screenshot below.
+
+   ![Context window card with the Relevant mode selected and the cosine-similarity sub-control visible](screenshots/09b-relevant-context-mode.png)
 4. **Budget** — pre-fills the Batch modal so a runaway run can't drain a wallet. Cache hits cost `$0.00` and never count.
 5. **LLM overrides** — per-project replacements for the global Settings → LLM defaults (base URL, translator model, helper model, reasoning effort). Empty fields fall back to the global value. Useful when one book needs a heavier model than your default.
+6. **Embeddings (project override)** — opt this project into a different embedding provider than the global default. Same fields as Settings → Embeddings (provider, model, batch size, custom price). Leaving everything blank inherits the global config.
+7. **Embedding inventory** — live histogram of which model produced each vector in the project (segments, project glossary, attached Lore Books). Lights stale rows up grey when the active model has drifted from what's on disk, and provides one-click _Re-embed everything_ + _Purge stale rows_ buttons. See the [Switching embedding models](#switching-embedding-models) section above for the full flow.
 
-Save with the header button or `Ctrl/⌘+S`. Every save writes a `project.updated` event to the audit log.
+Save with the header button or `Ctrl/⌘+S`. Every save writes a `project.updated` event to the audit log. Changing the embedding override (provider, model, or dim) prompts a confirm dialog explaining what becomes stale.
 
 ---
 

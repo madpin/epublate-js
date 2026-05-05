@@ -74,6 +74,12 @@ export const IntakeRunKind = {
   BOOK_INTAKE: "book_intake",
   CHAPTER_PRE_PASS: "chapter_pre_pass",
   TONE_SNIFF: "tone_sniff",
+  /**
+   * Background pass that embeds every segment in a project. Triggered
+   * after intake (for new projects) or by curator action (for
+   * existing projects when they enable embeddings). Phase 3.
+   */
+  EMBEDDING_PASS: "embedding_pass",
 } as const;
 export type IntakeRunKindT =
   (typeof IntakeRunKind)[keyof typeof IntakeRunKind];
@@ -138,10 +144,20 @@ export interface ProjectRow {
    *     prose (description, narration) goes through with no context
    *     overhead, which is much cheaper for novels that mix narration
    *     and exchanges.
+   *   - `"relevant"` — embed the segment and inject the top-K closest
+   *     translated/approved segments by cosine similarity. Crosses
+   *     chapter boundaries; falls back to `"previous"` when no
+   *     embedding provider is configured. Phase 3.
    *
    * Pre-existing rows missing this field default to `"previous"`.
    */
-  context_mode?: "off" | "previous" | "dialogue";
+  context_mode?: "off" | "previous" | "dialogue" | "relevant";
+  /**
+   * Minimum cosine similarity for `context_mode = "relevant"`. Anything
+   * below this is dropped from the picker. Pre-existing rows fall back
+   * to `0.65`, the documented default. Phase 3.
+   */
+  context_relevant_min_similarity?: number | null;
 }
 
 export interface ChapterRow {
@@ -224,7 +240,7 @@ export interface LlmCallRow {
   id: string;
   project_id: string;
   segment_id: string | null;
-  /** translate | translate_group | extract | extract_target | review | tone_sniff … */
+  /** translate | translate_group | extract | extract_target | review | tone_sniff | embedding … */
   purpose: string;
   model: string;
   prompt_tokens: number | null;
@@ -239,11 +255,26 @@ export interface LlmCallRow {
 
 export interface EmbeddingRow {
   id: string;
+  /**
+   * Scope discriminator. The same table lives in both per-project DBs
+   * (`segment` + `glossary_entry`) and per-Lore-Book DBs (just
+   * `glossary_entry`). The plan refers to these conceptually as
+   * `segment_embeddings`, `glossary_entry_embeddings`, and
+   * `lore_glossary_embeddings`; physically they share one Dexie table
+   * to keep migrations boring and the cosine-top-K helper
+   * polymorphic.
+   */
   scope: "segment" | "glossary_entry";
+  /** `segments.id` for `scope="segment"`, `glossary_entries.id` otherwise. */
   ref_id: string;
+  /** Model slug — the same `(scope, ref_id)` key may carry multiple model rows. */
   model: string;
+  /** Vector dimensionality (must equal `vector.byteLength / 4`). */
   dim: number;
+  /** Packed `Float32Array` (`packFloat32(vec)`); see `@/llm/embeddings/base`. */
   vector: Uint8Array;
+  /** When the row was written (ms since epoch). Used for incremental backfill. */
+  created_at: number;
 }
 
 export interface EventRow {
@@ -282,6 +313,20 @@ export interface AttachedLoreRow {
   mode: AttachedLoreModeT;
   priority: number;
   attached_at: number;
+  /**
+   * Embedding-retrieval overrides applied when the project's
+   * embedding provider is enabled. Pre-existing rows missing these
+   * fields fall back to the global defaults (top_k=16, min_sim=0.7).
+   *
+   * - `null` for both means "flatten the entire Lore Book into the
+   *   prompt" (legacy behaviour, matches `provider="none"` projects).
+   * - Setting `top_k` to a positive integer caps the number of
+   *   entries injected; the rest are dropped.
+   * - `min_similarity` filters cosine values below the threshold;
+   *   raises precision at the cost of recall.
+   */
+  retrieval_top_k?: number | null;
+  retrieval_min_similarity?: number | null;
 }
 
 export interface IntakeRunRow {
@@ -410,7 +455,49 @@ export interface LibraryLlmConfigRow {
     string,
     { input_per_mtok: number; output_per_mtok: number }
   >;
+  /**
+   * Embedding-provider configuration (default `"none"`). The
+   * embedding layer powers Lore-Book retrieval, the `relevant` cross-
+   * chapter context mode, and proposed-entry hints. Pre-existing rows
+   * missing this field implicitly behave as if `provider = "none"`.
+   */
+  embedding?: LibraryEmbeddingConfig;
 }
+
+/**
+ * Embedding-provider knobs (mirrors how `pricing_overrides` is keyed
+ * off the same singleton row).
+ *
+ * - `provider: "none"` — embeddings disabled. Translation behaves
+ *   exactly as in v1: locked + confirmed glossary entries, no Lore
+ *   retrieval, no cross-chapter `relevant` context, no proposed hints.
+ * - `provider: "openai-compat"` — uses the configured `base_url` /
+ *   `api_key` (or per-field overrides) and posts to `/v1/embeddings`.
+ * - `provider: "local"` — `@xenova/transformers` running on-device.
+ *   The first activation downloads the model from `huggingface.co`
+ *   after explicit curator consent.
+ */
+export interface LibraryEmbeddingConfig {
+  provider: "none" | "openai-compat" | "local";
+  model: string;
+  dim: number;
+  batch_size: number;
+  /** Optional per-embedding endpoint overrides; falls back to the LLM endpoint. */
+  base_url?: string | null;
+  api_key?: string | null;
+  /** USD per million input tokens (output tokens are always 0 for embeddings). */
+  price_per_mtok?: number | null;
+}
+
+export const DEFAULT_EMBEDDING_CONFIG: LibraryEmbeddingConfig = {
+  provider: "none",
+  model: "text-embedding-3-small",
+  dim: 1536,
+  batch_size: 64,
+  base_url: null,
+  api_key: null,
+  price_per_mtok: null,
+};
 
 // ---------- UI tokens ----------
 

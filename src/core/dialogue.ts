@@ -95,14 +95,20 @@ export function isDialogueSegment(text: string | null | undefined): boolean {
   return false;
 }
 
-export type ContextMode = "off" | "previous" | "dialogue";
+export type ContextMode = "off" | "previous" | "dialogue" | "relevant";
 
 export const CONTEXT_MODES: readonly ContextMode[] = [
   "previous",
   "dialogue",
+  "relevant",
   "off",
 ] as const;
 
 export function isContextMode(value: unknown): value is ContextMode {
-  return value === "off" || value === "previous" || value === "dialogue";
+  return (
+    value === "off" ||
+    value === "previous" ||
+    value === "dialogue" ||
+    value === "relevant"
+  );
 }
