@@ -1,0 +1,42 @@
+---
+description: ePub round-trip, placeholders, and segmentation rules.
+globs: src/formats/**/*.ts
+alwaysApply: false
+---
+
+# ePub format
+
+Format preservation is the single most important invariant. The Python
+`epublate` round-trip property test is the spec; the browser port must
+honour it.
+
+## Hard rules
+
+- **Placeholders only.** The LLM never sees raw markup. Inline tags
+  are encoded as `[[T0]]…[[/T0]]`, void tokens as `[[T0]]`, entities
+  as `[[T0]]`. The `inline_skeleton` records the original tag + attrs
+  so re-assembly is lossless.
+- **`applyParts(host, [placeholderize(host)])` is identity** on the
+  host's serialized form. Any change to the segmenter must keep this
+  property. There's a fast-check property test that gates regressions.
+- **One placeholder open ↔ one close**, exactly. Sentence splits
+  never land inside an open pair (`safeSplitPoints` enforces this).
+  Unmatched placeholders ⇒ `EpubFormatError`.
+- **Don't drop comments / PIs by surprise.** The current segmenter
+  drops them deliberately to mirror Python; document any new behaviour
+  in the file docstring.
+
+## Working with images
+
+- Inline `<img>` tokens are kept in `inline_skeleton` and resolved at
+  render time via `ImageResolver` (`src/lib/preview.tsx`). Don't
+  hardcode object URLs into segment text.
+- Standalone images (image-only `<p>` / `<figure>`) live outside the
+  segment table — surface them to the Reader via
+  `findStandaloneImages` rather than synthesising fake segments.
+
+## Reassembly
+
+- `reassembleChapter` runs the same validators that intake uses. If
+  you add a new segment field that affects layout, pipe it through
+  `Segment` *and* the validator.

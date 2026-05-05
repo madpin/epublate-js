@@ -1,0 +1,35 @@
+---
+description: Core invariants for the epublatejs browser-only ePub translation studio.
+alwaysApply: true
+---
+
+# Project invariants
+
+`epublatejs` is a static SPA that translates ePubs entirely in the
+browser. `AGENTS.md` is the long-form charter; this rule is the
+on-every-turn checklist.
+
+- **Local-first.** The only network call is to the user-configured
+  OpenAI-compatible LLM endpoint. No telemetry, analytics, CDN ping,
+  error reporter, or autoupdate. API keys live in IndexedDB on this
+  device.
+- **Format preservation.** ePub round-trip is byte-equivalent. Inline
+  markup is placeholderized as `[[T0]]…[[/T0]]` so the LLM never sees
+  raw HTML/XML. Validators in `src/formats/epub/validators.ts` reject
+  any reassembly that can't round-trip — don't bypass them.
+- **Glossary consistency.** Locked terms are *hard-fail*; target-only
+  entries are *soft-locked* (flagged, not auto-rejected). Aliases match
+  on word boundaries; particle suffixes round-trip
+  (`Saito-san` ↔ `Saito-さん`).
+- **Resumability.** Every batch operation persists per-segment state.
+  Closing the tab is harmless: re-opening picks up at `pending` /
+  `flagged`. Don't store work-in-progress only in React state.
+- **OpenAI-compatible only.** All LLM traffic goes through
+  `LLMProvider` (`src/llm/base.ts`). Every call is recorded in
+  `llm_calls`. Don't widen the provider surface.
+- **No silent data loss.** Bumping a Dexie schema means a `.version(N)`
+  upgrade with an explicit migration. Never wipe a user's data
+  without consent.
+
+When in doubt: smaller, audited changes that preserve resumability and
+round-trip identity beat clever ones.

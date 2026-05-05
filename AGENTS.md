@@ -89,3 +89,22 @@ A browser-only ePub translation studio that:
   call out to a third party.
 - Do **not** widen the LLM provider surface beyond OpenAI-compatible HTTP.
 - Do **not** delete or re-key Dexie stores without a migration.
+
+## Cursor rules
+
+The `.cursor/rules/` folder restates these invariants in machine-
+readable form for AI coding tools:
+
+- `always-core.mdc` – core project invariants (always applied).
+- `no-network-side-effects.mdc` – prohibits third-party network calls
+  (always applied).
+- `code-style.mdc` – TypeScript / React style for `src/`.
+- `testing.mdc` – Vitest + fake-indexeddb + fast-check conventions.
+- `db-dexie.mdc` – Dexie schema, repos, and migration rules.
+- `epub-format.mdc` – round-trip and placeholder invariants.
+- `llm-provider.mdc` – `LLMProvider` interface and cache rules.
+- `ui-shadcn.mdc` – shadcn/ui + Tailwind + accessibility conventions.
+- `state-zustand.mdc` – store conventions for `src/state/`.
+
+When the human-readable AGENTS.md changes, mirror the change into the
+relevant `.cursor/rules/` file.

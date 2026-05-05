@@ -1,0 +1,45 @@
+---
+description: TypeScript / React style for src/.
+globs: src/**/*.{ts,tsx}
+alwaysApply: false
+---
+
+# TypeScript & React style
+
+Match the existing code; the conventions below are non-negotiable.
+
+- **File-level docstring.** Every module starts with a `/**` block
+  explaining what it does and *why*. The Reader, the segmenter, and
+  the pipeline are good templates. Trim noise but keep intent.
+- **Naming.**
+  - `snake_case` for variables, function parameters, and *interface
+    fields* (mirrors the Python `epublate` schema): `project_id`,
+    `source_text`, `host_path`.
+  - `camelCase` for hooks (`useRunBatch`, `useLiveQuery`) and locally-
+    scoped helpers.
+  - `PascalCase` for components, classes, and exported types.
+- **Return types.** Components return `React.JSX.Element` (or
+  `React.JSX.Element | null`) explicitly. Async helpers declare their
+  `Promise<…>` return.
+- **Imports.** Use the `@/…` alias for src-relative imports
+  (`@/db/repo/segments`). Avoid deep relative chains.
+- **Comments are about *why*, not *what*.** Don't narrate code. Do
+  explain trade-offs, format invariants, or "we deliberately skip
+  this case because…". `// Fix: X` style notes are fine when they
+  point at a specific bug.
+- **No unused imports / unused vars.** Strict TS catches them; don't
+  silence with `_ =`.
+
+```ts
+// ❌ obvious narration
+function add(a: number, b: number): number {
+  // Sum the two numbers
+  return a + b;
+}
+
+// ✅ trade-off comment
+function add(a: number, b: number): number {
+  // Float math is fine here — callers normalize cents in `formatCost`.
+  return a + b;
+}
+```

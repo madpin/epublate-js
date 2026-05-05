@@ -1,0 +1,47 @@
+---
+description: Zustand store conventions for src/state/.
+globs: src/state/**/*.ts
+alwaysApply: false
+---
+
+# Zustand stores
+
+Stores under `src/state/` hold *process-scoped* UI state that must
+survive React unmount/remount but does NOT need durable persistence
+(that lives in IndexedDB). Examples: in-flight translation set, the
+batch progress meter, queued batches, app-wide LLM config snapshots.
+
+## Conventions
+
+- **One store per concern.** `useBatchStore`, `useTranslatingStore`,
+  `useAppStore`. Don't bundle unrelated slices.
+- **Default to project-scoped maps.** Most state is keyed by
+  `project_id` so switching projects resets cleanly without manual
+  clears: `by_project: Record<string, Set<string>>`.
+- **No persistence by default.** A page reload cancels in-flight work
+  anyway, so a fresh empty store is the correct boot state. Use
+  `localStorage` only for UI prefs (split-pane ratios, theme).
+- **Selectors return stable references.** When subscribing to
+  per-project slices, wrap the lookup in a selector factory so React
+  only re-renders when *that* slice changes:
+
+```ts
+export function translatingForProject(
+  project_id: string,
+): (state: { by_project: Record<string, Set<string>> }) => ReadonlySet<string> {
+  return (state) => state.by_project[project_id] ?? EMPTY;
+}
+
+// in component
+const ids = useTranslatingStore(translatingForProject(project_id));
+```
+
+- **Actions stay pure.** A store action that performs a network
+  request is a hook (e.g. `useRunBatch`) layered *on top* of the
+  store. Keep stores synchronous — they describe state, not effects.
+
+## Guarding queued work
+
+- Drain queues from a `useEffect` keyed on `active === null` rather
+  than re-entrancy inside the action; that keeps the React commit
+  cycle visible to the curator.

@@ -1,0 +1,41 @@
+---
+description: Block any non-LLM network call, telemetry, or third-party SDK.
+alwaysApply: true
+---
+
+# No third-party network calls
+
+`epublatejs` is a static SPA. The only outbound request is the
+user-configured OpenAI-compatible LLM endpoint. Everything else is a
+**privacy regression**.
+
+## Forbidden
+
+- Telemetry / analytics SDKs (Sentry, PostHog, Datadog RUM, GA, …).
+- Third-party fonts / CSS / scripts loaded from a CDN at runtime.
+  Bundle assets locally.
+- Auto-update channels, "phone home" version checks, crash reporters.
+- Cloud sync of projects, glossaries, or LLM keys.
+- New LLM provider SDKs that require their own HTTPS endpoint outside
+  the user's configured base URL.
+
+## When unsure
+
+If a dependency might add a network call (analytics tracker baked in,
+telemetry on by default), set up the integration in *off-by-default*
+mode behind an explicit user opt-in **and** document the data flow in
+`AGENTS.md`.
+
+## Allowed
+
+- The configured OpenAI-compatible endpoint, via `LLMProvider`.
+- Service-worker / vite asset fetches at build time (compile to a
+  static bundle).
+- IndexedDB, localStorage, OPFS — fully local storage.
+
+## Reviewer checklist
+
+- [ ] No new `fetch(...)` outside `src/llm/`.
+- [ ] No new `<script src=...>` tag pointing at a CDN.
+- [ ] No new dependency that auto-instruments.
+- [ ] No new analytics or telemetry imports.

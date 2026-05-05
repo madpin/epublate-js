@@ -133,6 +133,72 @@ describe("findStandaloneImages", () => {
     expect(found).toHaveLength(1);
     expect(found[0]!.splice_at).toBe(2);
   });
+
+  it("walks past a leading anchor placeholder in image-only paragraphs", async () => {
+    // Calibre/Atlantis-built ePubs (Le Petit Prince is the canonical
+    // example) frequently emit the final-page illustration as
+    // `<p><a id="aN"/><img/></p>` — the anchor is purely a navigation
+    // target and shouldn't shadow the image. The walker must recurse
+    // through the empty host, ignore the anchor, and emit the image.
+    const TRAILING_ANCHOR_IMG = `<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Ch.1</title></head>
+  <body>
+    <p>Opening line.</p>
+    <p>Closing line.</p>
+    <p><a id="a27"></a><img src="images/figure-1.png" alt="figure-1.png"/></p>
+  </body>
+</html>`;
+    const zip = new JSZip();
+    zip.file("mimetype", "application/epub+zip", { compression: "STORE" });
+    zip.file("META-INF/container.xml", CONTAINER_XML);
+    zip.file("OEBPS/content.opf", OPF);
+    zip.file("OEBPS/ch1.xhtml", TRAILING_ANCHOR_IMG);
+    zip.file("OEBPS/images/cover.jpg", new Uint8Array([0xff]));
+    zip.file("OEBPS/images/figure-1.png", new Uint8Array([0x89]));
+    const u8 = await zip.generateAsync({ type: "uint8array" });
+    const buf = new ArrayBuffer(u8.byteLength);
+    new Uint8Array(buf).set(u8);
+    const book = await loadEpub(buf);
+    const found = findStandaloneImages(book.chapters[0]!);
+    expect(found).toHaveLength(1);
+    expect(found[0]!.resolved).toBe("OEBPS/images/figure-1.png");
+    expect(found[0]!.splice_at).toBe(2);
+  });
+
+  it("emits one entry per <img> in a multi-image-only paragraph", async () => {
+    // Defensive: if a converter ever crams two illustrations into
+    // the same image-only paragraph, both should surface as
+    // standalones at the same splice point rather than one
+    // disappearing.
+    const PAIR_IMG = `<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Ch.1</title></head>
+  <body>
+    <p>Opening line.</p>
+    <p><img src="images/figure-1.png" alt="A"/><img src="images/cover.jpg" alt="B"/></p>
+  </body>
+</html>`;
+    const zip = new JSZip();
+    zip.file("mimetype", "application/epub+zip", { compression: "STORE" });
+    zip.file("META-INF/container.xml", CONTAINER_XML);
+    zip.file("OEBPS/content.opf", OPF);
+    zip.file("OEBPS/ch1.xhtml", PAIR_IMG);
+    zip.file("OEBPS/images/cover.jpg", new Uint8Array([0xff]));
+    zip.file("OEBPS/images/figure-1.png", new Uint8Array([0x89]));
+    const u8 = await zip.generateAsync({ type: "uint8array" });
+    const buf = new ArrayBuffer(u8.byteLength);
+    new Uint8Array(buf).set(u8);
+    const book = await loadEpub(buf);
+    const found = findStandaloneImages(book.chapters[0]!);
+    expect(found).toHaveLength(2);
+    expect(found.map((i) => i.resolved)).toEqual([
+      "OEBPS/images/figure-1.png",
+      "OEBPS/images/cover.jpg",
+    ]);
+    expect(found[0]!.splice_at).toBe(1);
+    expect(found[1]!.splice_at).toBe(1);
+  });
 });
 
 describe("buildChapterImageMap", () => {

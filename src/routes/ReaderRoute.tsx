@@ -232,13 +232,40 @@ export function ReaderRoute(): React.JSX.Element {
   // surface "standalone" images (image-only paragraphs/figures) so
   // the Reader can interleave them between segment cards.
   //
+  // `status` makes failures visible instead of swallowing them. The
+  // most common reasons we end up with no images are: (a) the
+  // project was created before we started persisting source bytes
+  // (`missing-source`), (b) the stored chapter href no longer maps
+  // to anything in the spine (`missing-chapter`), or (c) the parser
+  // threw (`error`). Each surfaces a hint in the Reader so the
+  // curator knows whether to re-import.
+  //
   // Memory hygiene: the effect cleans up object URLs when the chapter
   // changes or the component unmounts.
+  type ImageLoadStatus =
+    | "idle"
+    | "loading"
+    | "loaded"
+    | "missing-source"
+    | "missing-chapter"
+    | "error";
   const [chapter_assets, setChapterAssets] = React.useState<{
     chapter_id: string | null;
     image_map: ChapterImageMap | null;
     standalone: StandaloneImage[];
-  }>({ chapter_id: null, image_map: null, standalone: [] });
+    status: ImageLoadStatus;
+    inline_count: number;
+    resolved_count: number;
+    error_message: string | null;
+  }>({
+    chapter_id: null,
+    image_map: null,
+    standalone: [],
+    status: "idle",
+    inline_count: 0,
+    resolved_count: 0,
+    error_message: null,
+  });
   React.useEffect(() => {
     let cancelled = false;
     const cur_chapter_id = current_chapter_id;
@@ -246,24 +273,92 @@ export function ReaderRoute(): React.JSX.Element {
     if (!projectId || !cur_chapter_id || !cur_chapter || !segments) {
       setChapterAssets((prev) => {
         if (prev.image_map) revokeAll(prev.image_map);
-        return { chapter_id: null, image_map: null, standalone: [] };
+        return {
+          chapter_id: null,
+          image_map: null,
+          standalone: [],
+          status: "idle",
+          inline_count: 0,
+          resolved_count: 0,
+          error_message: null,
+        };
       });
       return;
     }
+    setChapterAssets((prev) => {
+      if (prev.chapter_id === cur_chapter_id && prev.status === "loading") {
+        return prev;
+      }
+      // Don't revoke the previous map yet — we may end up reusing it
+      // if the new load fails partway.
+      return {
+        chapter_id: cur_chapter_id,
+        image_map: prev.chapter_id === cur_chapter_id ? prev.image_map : null,
+        standalone:
+          prev.chapter_id === cur_chapter_id ? prev.standalone : [],
+        status: "loading",
+        inline_count: 0,
+        resolved_count: 0,
+        error_message: null,
+      };
+    });
     void (async () => {
       try {
         const bytes = await getOriginalEpubBytes(projectId);
-        if (cancelled || !bytes) return;
+        if (cancelled) return;
+        if (!bytes) {
+          console.warn(
+            `[Reader] no source ePub bytes for project ${projectId} — ` +
+              `IndexedDB row source_blobs/'original' is missing. ` +
+              `Re-import the ePub to restore image rendering.`,
+          );
+          setChapterAssets((prev) => {
+            if (prev.image_map) revokeAll(prev.image_map);
+            return {
+              chapter_id: cur_chapter_id,
+              image_map: null,
+              standalone: [],
+              status: "missing-source",
+              inline_count: 0,
+              resolved_count: 0,
+              error_message: null,
+            };
+          });
+          return;
+        }
         const loaded = await loadChapterAssets(bytes, cur_chapter.href);
-        if (cancelled || !loaded) return;
-        const skeletons: InlineToken[][] = (segments ?? []).map((row) => {
-          if (!row.inline_skeleton) return [];
-          try {
-            return JSON.parse(row.inline_skeleton) as InlineToken[];
-          } catch {
-            return [];
-          }
-        });
+        if (cancelled) return;
+        if (!loaded) {
+          console.warn(
+            `[Reader] chapter href "${cur_chapter.href}" not found in ` +
+              `the ePub spine. The stored chapter row may be stale; ` +
+              `try re-importing the project.`,
+          );
+          setChapterAssets((prev) => {
+            if (prev.image_map) revokeAll(prev.image_map);
+            return {
+              chapter_id: cur_chapter_id,
+              image_map: null,
+              standalone: [],
+              status: "missing-chapter",
+              inline_count: 0,
+              resolved_count: 0,
+              error_message: null,
+            };
+          });
+          return;
+        }
+        // `inline_skeleton` on disk is a JSON envelope:
+        // `{ skeleton, host_path, host_part, host_total_parts }`.
+        // Earlier this site naively `JSON.parse`d it and assumed the
+        // result was already the skeleton array, which produced the
+        // "skeleton is not iterable" error inside `buildChapterImageMap`
+        // — the parse returned the *envelope object*, not the array.
+        // Always go through `rowToSegment` so we get the same decoder
+        // the rest of the Reader uses.
+        const skeletons: InlineToken[][] = (segments ?? []).map(
+          (row) => rowToSegment(row).inline_skeleton,
+        );
         const image_map = buildChapterImageMap(
           loaded.book,
           loaded.chapter,
@@ -280,38 +375,80 @@ export function ReaderRoute(): React.JSX.Element {
         // with the inline ones (prevents double-decoding when the same
         // image appears both inline *and* standalone, which it does in
         // some publisher-built ePubs).
+        const missing_zip_entries: string[] = [];
         for (const item of standalone) {
           if (image_map.byResolved.has(item.resolved)) continue;
           const data = loaded.book.zip_entries.get(item.resolved);
-          if (!data) continue;
+          if (!data) {
+            missing_zip_entries.push(item.resolved);
+            continue;
+          }
           const url = bytesToObjectUrl(data, mimeForPath(item.resolved));
           if (!url) continue;
           image_map.byResolved.set(item.resolved, url);
           image_map.urls.push(url);
         }
+        if (missing_zip_entries.length > 0) {
+          console.warn(
+            `[Reader] ${missing_zip_entries.length} standalone image ` +
+              `path(s) missing from ePub ZIP for chapter ` +
+              `${cur_chapter.href}: ${missing_zip_entries
+                .slice(0, 5)
+                .join(", ")}${missing_zip_entries.length > 5 ? " …" : ""}`,
+          );
+        }
         if (cancelled) {
           revokeAll(image_map);
           return;
         }
+        // One-line summary so the curator (or a maintainer reading the
+        // console during a debug session) can confirm at a glance how
+        // many images each chapter contributed without dumping the
+        // full state.
+        console.info(
+          `[Reader] chapter "${cur_chapter.href}" loaded: ` +
+            `${standalone.length} standalone image(s), ` +
+            `${image_map.byRawSrc.size} inline image(s), ` +
+            `${image_map.byResolved.size} object URL(s) minted.`,
+        );
         setChapterAssets((prev) => {
-          if (prev.image_map) revokeAll(prev.image_map);
-          return { chapter_id: cur_chapter_id, image_map, standalone };
+          if (prev.image_map && prev.image_map !== image_map) {
+            revokeAll(prev.image_map);
+          }
+          return {
+            chapter_id: cur_chapter_id,
+            image_map,
+            standalone,
+            status: "loaded",
+            inline_count: image_map.byRawSrc.size,
+            resolved_count: image_map.byResolved.size,
+            error_message: null,
+          };
         });
       } catch (err) {
         if (cancelled) return;
         // Best-effort: failing to load images should never break
         // translation. Log and fall back to text markers.
-        console.warn("ReaderRoute: failed to load chapter images", err);
+        console.warn("[Reader] failed to load chapter images", err);
         setChapterAssets((prev) => {
           if (prev.image_map) revokeAll(prev.image_map);
-          return { chapter_id: null, image_map: null, standalone: [] };
+          return {
+            chapter_id: cur_chapter_id,
+            image_map: null,
+            standalone: [],
+            status: "error",
+            inline_count: 0,
+            resolved_count: 0,
+            error_message:
+              err instanceof Error ? err.message : String(err),
+          };
         });
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [projectId, current_chapter_id, chapters, segments]);
+  }, [projectId, current_chapter_id, chapters, segments, detail?.target_lang]);
 
   React.useEffect(() => {
     return () => {
@@ -875,6 +1012,10 @@ export function ReaderRoute(): React.JSX.Element {
           standalone_images={chapter_assets.standalone}
           image_map={chapter_assets.image_map}
           image_resolver={image_resolver}
+          image_status={chapter_assets.status}
+          image_inline_count={chapter_assets.inline_count}
+          image_resolved_count={chapter_assets.resolved_count}
+          image_error_message={chapter_assets.error_message}
           active_segment_id={active_segment_id}
           translating_ids={translating_ids}
           onSelect={setActiveSegmentId}
@@ -888,6 +1029,10 @@ export function ReaderRoute(): React.JSX.Element {
           standalone_images={chapter_assets.standalone}
           image_map={chapter_assets.image_map}
           image_resolver={image_resolver}
+          image_status={chapter_assets.status}
+          image_inline_count={chapter_assets.inline_count}
+          image_resolved_count={chapter_assets.resolved_count}
+          image_error_message={chapter_assets.error_message}
           active_segment_id={active_segment_id}
           translating_ids={translating_ids}
           onSelect={setActiveSegmentId}
@@ -1102,6 +1247,16 @@ interface SegmentPaneProps {
   standalone_images: StandaloneImage[];
   image_map: ChapterImageMap | null;
   image_resolver: (raw_src: string) => string | null | undefined;
+  image_status:
+    | "idle"
+    | "loading"
+    | "loaded"
+    | "missing-source"
+    | "missing-chapter"
+    | "error";
+  image_inline_count: number;
+  image_resolved_count: number;
+  image_error_message: string | null;
   active_segment_id: string | null;
   translating_ids: ReadonlySet<string>;
   onSelect(id: string): void;
@@ -1117,6 +1272,10 @@ const SegmentPane = React.forwardRef<HTMLDivElement, SegmentPaneProps>(
       standalone_images,
       image_map,
       image_resolver,
+      image_status,
+      image_inline_count,
+      image_resolved_count,
+      image_error_message,
       active_segment_id,
       translating_ids,
       onSelect,
@@ -1144,9 +1303,39 @@ const SegmentPane = React.forwardRef<HTMLDivElement, SegmentPaneProps>(
     );
     return (
       <section className="flex min-h-0 flex-col">
-        <div className="border-b px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-          {title}
+        <div className="flex items-center justify-between gap-2 border-b px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <span>{title}</span>
+          {side === "source" ? (
+            <ImageStatusBadge
+              status={image_status}
+              standalone_count={standalone_images.length}
+              inline_count={image_inline_count}
+              resolved_count={image_resolved_count}
+              error_message={image_error_message}
+            />
+          ) : null}
         </div>
+        {side === "source" && image_status === "missing-source" ? (
+          <div className="border-b bg-warning/10 px-3 py-2 text-[11px] text-warning-foreground">
+            <strong>ePub source bytes are missing</strong> for this project,
+            so images can't be rendered. Re-import the project from its
+            original .epub to restore image rendering. (The translation
+            data itself is unaffected.)
+          </div>
+        ) : null}
+        {side === "source" && image_status === "missing-chapter" ? (
+          <div className="border-b bg-warning/10 px-3 py-2 text-[11px] text-warning-foreground">
+            <strong>This chapter's source HTML can't be located</strong> in
+            the stored ePub. The chapter row may be stale; re-import the
+            project to restore image rendering.
+          </div>
+        ) : null}
+        {side === "source" && image_status === "error" ? (
+          <div className="border-b bg-destructive/10 px-3 py-2 text-[11px] text-destructive">
+            <strong>Failed to load chapter images.</strong>{" "}
+            {image_error_message ?? "(no error details)"}
+          </div>
+        ) : null}
         <div
           ref={ref}
           onScroll={onScroll}
@@ -1175,7 +1364,7 @@ const SegmentPane = React.forwardRef<HTMLDivElement, SegmentPaneProps>(
                 image_map?.byResolved.get(item.image.resolved) ?? null;
               return (
                 <StandaloneImageCard
-                  key={`img-${item.image.doc_order}-${item.image.resolved}`}
+                  key={`img-${item.image.splice_at}-${item.image.resolved}`}
                   image={item.image}
                   url={url}
                 />
@@ -1262,6 +1451,90 @@ function interleaveStandaloneImages(
   return out;
 }
 
+interface ImageStatusBadgeProps {
+  status:
+    | "idle"
+    | "loading"
+    | "loaded"
+    | "missing-source"
+    | "missing-chapter"
+    | "error";
+  standalone_count: number;
+  inline_count: number;
+  resolved_count: number;
+  error_message: string | null;
+}
+
+/**
+ * Compact status pill for image loading. Always visible in the
+ * source pane header so curators (and us, when debugging) can tell
+ * at a glance whether the image pipeline ran. The hover title
+ * spells out exactly what happened — handy when the visible pill
+ * is just "0 imgs" and you need to know *why*.
+ */
+function ImageStatusBadge({
+  status,
+  standalone_count,
+  inline_count,
+  resolved_count,
+  error_message,
+}: ImageStatusBadgeProps): React.JSX.Element | null {
+  let label: string;
+  let title: string;
+  let tone: "neutral" | "warning" | "danger" = "neutral";
+  switch (status) {
+    case "idle":
+      return null;
+    case "loading":
+      label = "loading…";
+      title = "Loading chapter images…";
+      break;
+    case "loaded": {
+      const total = standalone_count + inline_count;
+      label = `${total} img${total === 1 ? "" : "s"}`;
+      title =
+        `Images for this chapter:\n` +
+        `  ${standalone_count} standalone (image-only blocks)\n` +
+        `  ${inline_count} inline (mid-paragraph)\n` +
+        `  ${resolved_count} object URL(s) minted`;
+      if (total === 0) {
+        title += "\n(this chapter has no images, or none survived ZIP lookup)";
+      }
+      break;
+    }
+    case "missing-source":
+      label = "no source";
+      title =
+        "ePub source bytes are missing for this project. Re-import to restore images.";
+      tone = "warning";
+      break;
+    case "missing-chapter":
+      label = "missing in spine";
+      title =
+        "This chapter's source HTML can't be located in the stored ePub.";
+      tone = "warning";
+      break;
+    case "error":
+      label = "error";
+      title = `Failed to load images: ${error_message ?? "(no details)"}`;
+      tone = "danger";
+      break;
+  }
+  return (
+    <span
+      className={cn(
+        "rounded-full px-2 py-0.5 font-mono text-[10px] uppercase",
+        tone === "neutral" && "bg-muted text-muted-foreground",
+        tone === "warning" && "bg-warning/15 text-warning",
+        tone === "danger" && "bg-destructive/15 text-destructive",
+      )}
+      title={title}
+    >
+      {label}
+    </span>
+  );
+}
+
 interface StandaloneImageCardProps {
   image: StandaloneImage;
   url: string | null;
@@ -1271,39 +1544,61 @@ function StandaloneImageCard({
   image,
   url,
 }: StandaloneImageCardProps): React.JSX.Element {
-  const label =
-    image.alt?.trim() ||
-    image.raw_src.split("/").pop() ||
-    "image";
+  const trimmed_alt = image.alt?.trim() ?? "";
+  const filename = image.raw_src.split("/").pop() ?? "";
+  const fallback_label = trimmed_alt || filename || "image";
   if (!url) {
     // No bytes resolved (broken ePub or external URL). Render a small
     // text marker so the curator knows something was *supposed* to be
     // here without staking out cover-sized space.
     return (
-      <p className="my-1 px-1 text-[11px] italic text-muted-foreground">
-        [image: {label}]
+      <p className="my-1 px-1 text-center text-[11px] italic text-muted-foreground">
+        [image: {fallback_label}]
       </p>
     );
   }
-  // Mirror the "in-prose illustration" rendering you'd see in an
-  // e-reader: no card, no border, no background — just the image
-  // itself, sized to the column width with a sane max so giant
-  // illustrations don't push the curator out of context.
+  // Mirror the way an e-reader lays out an illustration: no border,
+  // no card, no background — just the image, centered within the
+  // column. We render at the image's natural size when it fits, fall
+  // back to the column width when it's wider, and cap height at the
+  // viewport so a full-bleed illustration can't push every neighbour
+  // off-screen. `h-auto`/`w-auto` keep the aspect ratio intact in
+  // both dimensions; `object-contain` is defensive in case any
+  // upstream CSS introduces a hard size.
+  const caption = isMeaningfulAltText(trimmed_alt) ? trimmed_alt : null;
   return (
-    <figure className="my-2 px-1 text-left">
+    <figure className="my-4 flex flex-col items-center text-center">
       <img
         src={url}
-        alt={label}
+        alt={trimmed_alt || filename}
         loading="lazy"
-        className="block max-h-80 w-auto max-w-full rounded-sm"
+        decoding="async"
+        className="block h-auto w-auto max-h-[80vh] max-w-full object-contain"
       />
-      {image.alt?.trim() ? (
-        <figcaption className="mt-1 text-[11px] italic text-muted-foreground">
-          {image.alt.trim()}
+      {caption ? (
+        <figcaption className="mt-1 max-w-full text-[11px] italic text-muted-foreground">
+          {caption}
         </figcaption>
       ) : null}
     </figure>
   );
+}
+
+/**
+ * True iff `alt` looks like meaningful caption text rather than a
+ * filename / placeholder. Most Calibre-built ePubs (Le Petit Prince
+ * included) ship `alt="img17.jpg"` for every illustration; surfacing
+ * that as a figcaption clutters the Reader without telling the
+ * curator anything new. We treat anything that *looks like* a bare
+ * filename — `imgN.ext`, `figureN.ext`, `coverN.png`, etc. — as noise.
+ */
+function isMeaningfulAltText(alt: string): boolean {
+  if (!alt) return false;
+  // A trailing image extension is a strong signal we're staring at a
+  // filename. Cover the common formats; anything else falls through.
+  if (/\.(jpe?g|png|gif|webp|svg|avif|bmp|tiff?)$/i.test(alt)) return false;
+  // Otherwise treat as caption.
+  return true;
 }
 
 interface SegmentCardProps {

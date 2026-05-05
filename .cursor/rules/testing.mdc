@@ -1,0 +1,38 @@
+---
+description: Vitest, fake-indexeddb, fast-check, colocated tests.
+globs: src/**/*.test.{ts,tsx}
+alwaysApply: false
+---
+
+# Testing discipline
+
+- **Colocated.** Tests live next to the source: `foo.ts` → `foo.test.ts`.
+- **Vitest.** No Jest. Use `describe / it / expect`, plus
+  `beforeEach`/`afterEach` for setup. Stub globals (e.g.
+  `URL.createObjectURL`) in `beforeEach` and restore in `afterEach`.
+- **DB tests use fake-indexeddb.** Open a fresh project DB per test
+  (or `clear()` the relevant tables in `beforeEach`). Never share
+  state across `describe` blocks.
+- **Property-based testing.** Use `fast-check` for invariants like
+  "ePub round-trip is identity" or "applyParts inverts placeholderize."
+- **Component tests.** `@testing-library/react` only. No enzyme, no
+  shallow rendering. Assert on user-visible text / aria roles, not
+  internal state.
+- **No network.** ALL HTTP calls go through `LLMProvider`. Tests use
+  the `mock` provider (`src/llm/mock.ts`) or stub `provider.chat`
+  via `vi.spyOn`. A test that hits real fetch is a bug.
+
+```ts
+// ✅ DB test pattern
+let project_id: string;
+beforeEach(async () => {
+  const project = await createProject({ /* … */ });
+  project_id = project.id;
+});
+
+// ✅ provider stub
+const provider = new MockProvider();
+const spy = vi.spyOn(provider, "chat");
+await translateSegment({ /* … */, provider });
+expect(spy).toHaveBeenCalledTimes(1);
+```

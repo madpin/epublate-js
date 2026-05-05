@@ -1,0 +1,46 @@
+---
+description: LLMProvider interface and prompt/cache rules.
+globs: src/llm/**/*.ts
+alwaysApply: false
+---
+
+# LLM provider layer
+
+All LLM traffic flows through the `LLMProvider` interface in
+`src/llm/base.ts`. Concrete implementations:
+
+- `openai_compat` — HTTP fetch with retry/backoff, honours
+  `Retry-After`, surfaces rate limits as `LLMRateLimitError`.
+- `mock` — deterministic, no network. Use it in tests and when the
+  curator toggles "mock mode" in Settings.
+
+## Hard rules
+
+- **OpenAI-compatible only.** Do not add SDK clients (Anthropic,
+  Vertex, etc.). The endpoint is HTTP, the response shape is OpenAI
+  chat-completions. Curators bring whatever provider speaks that
+  protocol.
+- **Every call is logged.** `recordLlmCall(...)` writes the request,
+  response, model, token counts, cost, cache hit, and segment id to
+  the per-project `llm_calls` table. Don't skip the logging on the
+  cache-hit path — it's how the curator audits spend.
+- **Cache key is content-addressed.** `cacheKeyForMessages` hashes
+  model + messages + glossary state. Adding a new prompt input means
+  mixing it into the cache key, otherwise stale translations persist
+  past edits.
+- **No prompt mutation after building.** `buildTranslatorMessages`
+  returns the canonical message list; downstream code only reads it.
+
+## Pricing & tokens
+
+- Tokens come from `gpt-tokenizer` (cheap, deterministic). Don't
+  estimate from `text.length / 4` outside of the segmenter's
+  pre-flight cost check.
+- Costs use per-model pricing in IndexedDB; unset pricing renders as
+  `—`, never `$0.00`. Use `formatCost` for display.
+
+```ts
+// ✅ propagate new prompt input into the cache key
+const messages = buildTranslatorMessages({ /* … chapter_notes */ });
+const cache_key = await cacheKeyForMessages({ model, messages, glossary_hash });
+```

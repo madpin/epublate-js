@@ -120,16 +120,20 @@ function imageMarker(
     "";
   const url = resolver?.(src) ?? null;
   if (url) {
-    // Inline image: render at natural size (capped) without borders /
-    // backgrounds — same vibe as a typeset book illustration. The
-    // legacy chrome made these read like chapter covers, which the
-    // curators rightly complained about.
+    // Inline image: render flowing with text, no chrome, capped to a
+    // height that lets the curator still see the surrounding line.
+    // `inline-block` keeps the image on the same baseline as the
+    // text; `align-middle` aligns its centre to the text x-height
+    // (the most book-illustration-like default); the `max-w-full`
+    // guarantees we never overflow the column even when the image
+    // is huge in its native size.
     return (
       <img
         src={url}
         alt={alt}
-        className="my-1 inline-block max-h-72 max-w-full rounded-sm align-middle"
         loading="lazy"
+        decoding="async"
+        className="my-0.5 inline-block max-h-40 max-w-full align-middle"
       />
     );
   }

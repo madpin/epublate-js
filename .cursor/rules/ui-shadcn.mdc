@@ -1,0 +1,45 @@
+---
+description: shadcn/ui + Tailwind + Radix + accessibility for screens.
+globs: src/{components,routes,hooks}/**/*.{ts,tsx}
+alwaysApply: false
+---
+
+# UI conventions
+
+## Stack
+
+- **Tailwind CSS v4** for layout / spacing / colour. Prefer utility
+  classes over hand-rolled CSS. The four themes (`epublate`,
+  `textual-dark`, `textual-light`, `epublate-contrast`) live in
+  `src/styles/theme.css`.
+- **shadcn/ui** primitives in `src/components/ui/*`. Don't reinvent —
+  if a primitive's variant is missing, extend it instead of forking.
+- **Radix UI** under shadcn for dialogs, popovers, dropdowns.
+- **`cn()` for class merging.** Import from `@/lib/utils`.
+
+## Accessibility (Indeed A11y guidelines)
+
+- Every interactive element is a `<button>` (or anchor). No
+  `<div onClick>`.
+- Provide `aria-label` for icon-only buttons; provide `title` so the
+  tooltip surfaces on hover.
+- Decorative glyphs use `aria-hidden`.
+- Live status changes (e.g. "translating now" badge) include a
+  textual count, not just a colour, so screen-reader users get the
+  same signal.
+- Keyboard-first: every screen registers its hotkeys with the
+  cheat-sheet store (`?` / F1 surfaces them).
+
+## Layout
+
+- 12-column responsive grids; `min-w-0` and `min-h-0` on flex
+  children that need to shrink.
+- Persistent overflow uses `overflow-y-auto` on inner panes, not on
+  `<body>`. The persistent batch status bar pins to the bottom.
+
+```tsx
+// ✅ icon button
+<Button size="sm" variant="ghost" aria-label="Edit notes" title="Edit notes">
+  <Pencil className="size-4" aria-hidden />
+</Button>
+```

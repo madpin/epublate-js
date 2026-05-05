@@ -1,0 +1,43 @@
+---
+description: Dexie schema, migrations, and repo conventions.
+globs: src/db/**/*.ts
+alwaysApply: false
+---
+
+# Database (Dexie / IndexedDB)
+
+Two Dexie databases:
+
+- `library` (singleton) — recents + UI prefs, defined in
+  `src/db/library.ts`.
+- per-project (one DB per project) — opened lazily via
+  `openProjectDb(projectId)` in `src/db/dexie.ts`. Tables: `projects`,
+  `chapters`, `segments`, `glossary`, `events`, `llm_calls`, …
+
+## Schema rules
+
+- **Table types live in `src/db/schema.ts`.** Add a new field there
+  first; the repo functions follow.
+- **Always migrate.** Bumping a `.version(N)` requires a `.upgrade(tx
+  => …)` block. Never re-key a store or drop a column without
+  preserving the user's existing rows. There is *no* "reset DB on
+  schema bump" path.
+- **No silent reset.** If a future migration would have to wipe data,
+  surface a confirm dialog through the `library` row before deleting.
+- **Status enums are frozen objects.** Use `SegmentStatus.PENDING`,
+  not the literal string, so renames stay typesafe.
+
+## Repo functions
+
+`src/db/repo/*.ts` is the only layer that calls `db.<table>.<op>`.
+Keep them small and testable.
+
+```ts
+// ✅ repo helper signature
+export async function countPendingByChapter(
+  projectId: string,
+): Promise<Map<string, number>> { /* … */ }
+
+// ❌ don't call dexie from a component
+const pending = await openProjectDb(id).segments.count();
+```
