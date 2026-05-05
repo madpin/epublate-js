@@ -4,6 +4,12 @@ Operational rules-of-the-road for AI agents (and humans) working on
 `epublatejs`. The Python `epublate` project is the source of truth; this
 file translates its hard invariants into browser-port terms.
 
+> **See also.** The narrative companion to this terse doc is
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — modules, data flow,
+> sequence diagrams, and the cache-key recipe explained at length. For
+> the curator-side tour of every screen, read
+> [`docs/USAGE.md`](docs/USAGE.md). The README front page links to both.
+
 ## Project mission
 
 A browser-only ePub translation studio that:
@@ -98,6 +104,9 @@ readable form for AI coding tools:
 - `always-core.mdc` – core project invariants (always applied).
 - `no-network-side-effects.mdc` – prohibits third-party network calls
   (always applied).
+- `docs-and-screenshots.mdc` – keep `README.md`, `docs/ARCHITECTURE.md`,
+  `docs/USAGE.md`, and `tools/snap.mjs` screenshots in sync when a
+  screen, module, or schema changes (always applied).
 - `code-style.mdc` – TypeScript / React style for `src/`.
 - `testing.mdc` – Vitest + fake-indexeddb + fast-check conventions.
 - `db-dexie.mdc` – Dexie schema, repos, and migration rules.

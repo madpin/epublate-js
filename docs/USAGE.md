@@ -2,7 +2,9 @@
 
 A tour of the app from "I just opened it" to "I have a translated ePub on my disk." Read it linearly the first time; bookmark the section headers as a reference afterwards.
 
-> Screenshots live in [`docs/screenshots/`](screenshots). The shipped placeholders are intentional — they identify each screen by name and let the docs render even before you've captured the real images. Replace them at any time; the filenames are the contract.
+> Screenshots live in [`docs/screenshots/`](screenshots). They're captured deterministically by `tools/snap.mjs` against `?mock=1`; see the screenshot folder's [README](screenshots/README.md) for how to refresh them.
+>
+> If you want the developer-side counterpart (modules, data flow, cache key recipe, ePub round-trip invariants), read [**ARCHITECTURE.md**](ARCHITECTURE.md) next.
 
 ## Table of contents
 
@@ -54,7 +56,7 @@ Two invariants the whole tool relies on:
 
 ## First run
 
-![First run — the empty Projects screen with the dropzone and the "New project" button](screenshots/01-projects-empty.svg)
+![First run — the empty Projects screen with the dropzone and the "New project" button](screenshots/01-projects-empty.png)
 
 When you open `http://localhost:5173` (or your deployed URL) for the first time, you see the **Projects** screen. There's nothing here yet. Two paths to populate it:
 
@@ -69,7 +71,7 @@ The sidebar's **Library** section (Projects, Lore Books) stays visible everywher
 
 ## Configuring an LLM endpoint
 
-![Settings → LLM with a base URL, key, and the green "Connection OK" pill after a successful test](screenshots/12-settings-llm.svg)
+![Settings → LLM with a base URL, key, and the green "Connection OK" pill after a successful test](screenshots/12-settings-llm.png)
 
 Open **Settings** from the sidebar footer. The LLM tab has four important fields:
 
@@ -93,7 +95,7 @@ If you don't have an LLM yet, append `?mock=1` to any URL or toggle **Mock LLM m
 
 ## Creating your first project
 
-![New project modal showing the chosen ePub, source / target language pickers, and a style preset dropdown with "Literary fiction" selected](screenshots/02-new-project-modal.svg)
+![New project modal showing the chosen ePub, source / target language pickers, and a style preset dropdown with "Literary fiction" selected](screenshots/02-new-project-modal.png)
 
 Click **New project** (or drop an `.epub` directly onto the dropzone). The modal asks for:
 
@@ -114,7 +116,7 @@ You can skip intake by toggling it off in the modal — running it later from th
 
 ## The Dashboard
 
-![Dashboard with progress card, attached lore books, and a long scrollable chapter list](screenshots/03-dashboard.svg)
+![Dashboard with progress card, attached lore books, and a long scrollable chapter list](screenshots/03-dashboard.png)
 
 The Dashboard is the project's home page. Six things to know:
 
@@ -138,7 +140,7 @@ Footer actions:
 
 ## The Reader
 
-![Reader showing chapter list on the left, source segments in the middle, and target segments on the right with the active segment highlighted in primary colour](screenshots/04-reader.svg)
+![Reader showing chapter list on the left, source segments in the middle, and target segments on the right with the active segment highlighted in primary colour](screenshots/04-reader.png)
 
 The Reader is where the per-segment work happens. Three columns:
 
@@ -174,24 +176,22 @@ Inputs and textareas swallow the hotkeys silently — typing "t" inside a search
 
 ## Translating chapter by chapter
 
-![Reader header with the "Translate chapter" button showing a count badge of 23 pending segments](screenshots/05a-reader-translate-chapter.svg)
+![Reader header with the "Translate chapter" button showing a count badge of 23 pending segments](screenshots/05a-reader-translate-chapter.png)
 
 Two ways to translate one chapter at a time:
 
 - **Press `Shift+T`** anywhere in the Reader (outside text inputs).
 - **Click "Translate chapter"** in the Reader header. The button shows the count of remaining pending segments in the current chapter.
 
-Both open the **Batch modal pre-scoped to the current chapter**. You can still tweak concurrency, budget, and bypass-cache before launching.
+Both open the **Batch modal pre-scoped to the current chapter**. You can still tweak concurrency, budget, and bypass-cache before launching. The modal is identical to the project-wide one shown below — only the default scope differs.
 
 This is the recommended flow for the first read-through of a book — translate one chapter, skim it in the Reader, fix any glossary issues, then translate the next. The cost stays bounded and any glossary correction propagates to subsequent chapters.
-
-![Translate chapter modal — concurrency = 4, budget = $0.10, "bypass cache" off, with the chapter scope locked](screenshots/05b-translate-chapter-modal.svg)
 
 ---
 
 ## Running a project-wide batch
 
-![Batch modal launched from the Dashboard, showing all 1,432 pending segments queued and a $1.00 budget cap](screenshots/05c-batch-modal-dashboard.svg)
+![Batch modal launched from the Dashboard, showing all 1,432 pending segments queued and a $1.00 budget cap](screenshots/05c-batch-modal-dashboard.png)
 
 For a full project run, click **Translate batch** on the Dashboard. The modal exposes:
 
@@ -210,7 +210,7 @@ Per-segment failures are captured as `batch.segment_failed` events and don't sin
 
 ## The Glossary
 
-![Glossary screen with 184 entries; the search box highlighted, two locked entries with red shields, and a target-only entry showing the alias chip](screenshots/06-glossary.svg)
+![Glossary screen with 184 entries; the search box highlighted, two locked entries with red shields, and a target-only entry showing the alias chip](screenshots/06-glossary.png)
 
 The glossary is your project's lore bible. Entries have:
 
@@ -241,7 +241,7 @@ Editing a locked entry's target term marks every segment whose source matched th
 
 ## The Inbox
 
-![Inbox showing 17 flagged segments with reason chips: "glossary violation", "placeholder mismatch", and an Apply Cascade banner](screenshots/08-inbox.svg)
+![Inbox showing 17 flagged segments with reason chips: "glossary violation", "placeholder mismatch", and an Apply Cascade banner](screenshots/08-inbox.png)
 
 The Inbox is where work goes when something needs your attention:
 
@@ -257,7 +257,7 @@ The Inbox is read-write: every action there is the same one you'd take in the Re
 
 ## Project Settings
 
-![Project Settings screen with five cards: Identity, Style, Context window, Budget, LLM overrides](screenshots/09-project-settings.svg)
+![Project Settings screen with five cards: Identity, Style, Context window, Budget, LLM overrides](screenshots/09-project-settings.png)
 
 The new dedicated Project Settings screen consolidates every per-project knob in one place. Five sections:
 
@@ -273,7 +273,7 @@ Save with the header button or `Ctrl/⌘+S`. Every save writes a `project.update
 
 ## Lore Books
 
-![Lore Books library — a table of three Lore Books with their entry counts, source / target languages, and "Open" / "Detach all" actions](screenshots/10-lore-books.svg)
+![Lore Books library — a table of three Lore Books with their entry counts, source / target languages, and "Open" / "Detach all" actions](screenshots/10-lore-books.png)
 
 A Lore Book is a standalone bundle of glossary entries you can attach to multiple projects. Use cases:
 
@@ -281,9 +281,7 @@ A Lore Book is a standalone bundle of glossary entries you can attach to multipl
 - A genre conventions sheet (e.g. mecha names always in katakana with a romanized alias).
 - A house-style sheet for your translation studio.
 
-Click a Lore Book to enter its dashboard:
-
-![Lore Book dashboard — entry count, source ePub list, ingest history, attached projects](screenshots/11-lore-book-dashboard.svg)
+Click a Lore Book to enter its dashboard. The Lore Book dashboard surfaces the entry count, the list of source ePubs that have been ingested, the ingest history, and the projects this Lore Book is currently attached to.
 
 You can populate a Lore Book in three ways:
 
@@ -297,7 +295,7 @@ To attach a Lore Book to a project, open the Dashboard, click **Attach** on the 
 
 ## Helper LLM intake & tone sniff
 
-![Intake runs screen — a list of three runs, the latest with a "Apply suggested style: Hard sci-fi" CTA](screenshots/13-intake-runs.svg)
+![Intake runs screen — a list of three runs, the latest with a "Apply suggested style: Hard sci-fi" CTA](screenshots/13-intake-runs.png)
 
 The helper LLM is the cheap second brain. It runs in two modes:
 
@@ -312,7 +310,7 @@ The **tone sniffer** is a specialised intake that scores the source against the 
 
 ## Cost, caching & budgets
 
-![LLM activity screen — cost meter, prompt / completion token counts, and a table of recent calls with cache hits highlighted](screenshots/14-llm-activity.svg)
+![LLM activity screen — cost meter, prompt / completion token counts, and a table of recent calls with cache hits highlighted](screenshots/14-llm-activity.png)
 
 Every LLM call is audited in the `llm_calls` table:
 
@@ -363,7 +361,7 @@ Bundles do **not** carry the Reader scroll position (it lives in `localStorage`,
 
 Press `?` or `F1` from any screen to open the cheat sheet:
 
-![Keyboard shortcuts dialog grouped by Global, Reader, Glossary, Batch / Inbox](screenshots/15-cheat-sheet.svg)
+![Keyboard shortcuts dialog grouped by Global, Reader, Glossary, Batch / Inbox](screenshots/15-cheat-sheet.png)
 
 | Group       | Combo       | Action                                          |
 | ----------- | ----------- | ----------------------------------------------- |
@@ -483,5 +481,6 @@ Every edit writes a `segment.edited` event to the audit log; nothing is irrevers
 ## Where to go from here
 
 - The cheat sheet (`?` from any screen) is the fastest reference for daily use.
-- Architecture conventions and invariants live in [`AGENTS.md`](../AGENTS.md). Read it before changing the segmentation pipeline or the cache key shape.
+- The developer-side architectural deep dive lives in [`ARCHITECTURE.md`](ARCHITECTURE.md) — modules, data flow, cache key recipe, ePub round-trip invariants, and where to look first when you want to change something.
+- Hard invariants restated for AI agents (and humans) modifying the codebase live in [`AGENTS.md`](../AGENTS.md). Read it before changing the segmentation pipeline or the cache key shape.
 - Bug reports & PRs welcome — see the contributing notes in the [README](../README.md#contributing).

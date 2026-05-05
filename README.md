@@ -5,10 +5,10 @@
 Translate full-length novels with consistent terminology, tone, and style — your book, your glossary, your LLM, your device. The whole tool is a static SPA: nothing leaves the browser except the prompts you choose to send to your configured LLM endpoint.
 
 <p align="center">
-  <img src="docs/screenshots/00-hero.svg" alt="epublate dashboard showing translated chapters, attached lore book, and the active style profile" width="100%" />
+  <img src="docs/screenshots/00-hero.png" alt="epublate dashboard for Le Petit Prince: 772 / 772 segments translated, attached lore book, the active style profile, and a chapter list." width="100%" />
 </p>
 
-> Faithful port of the [`epublate`](https://github.com/madpin/epublate) Python TUI to a fully offline web app. SQLite became IndexedDB, `lxml` became native `DOMParser`, the `openai` SDK became `fetch`, and the Textual TUI became a keyboard-first React app — but the prompts, the glossary semantics, and the segmentation invariants are byte-equivalent.
+> Faithful port of the Python TUI [`epublate`](https://github.com/madpin/epublate) to a fully offline web app. SQLite became IndexedDB, `lxml` became native `DOMParser`, the `openai` SDK became `fetch`, and the Textual TUI became a keyboard-first React app — but the prompts, the glossary semantics, and the segmentation invariants are byte-equivalent.
 
 ---
 
@@ -30,6 +30,44 @@ epublate fixes all four:
 
 ---
 
+## See it in motion
+
+### The Reader — side-by-side panes, segment-anchored scroll sync
+
+<p align="center">
+  <img src="docs/screenshots/04-reader.png" alt="The Reader showing chapter sidebar on the left, source segments in the middle, and target segments on the right; the focused segment is highlighted; the footer shows progress (30 segments · 30 translated · 0 approved); the sidebar's mock-mode banner makes the demo origin obvious." width="100%" />
+</p>
+
+Every segment is its own card. Translated text is rarely the same length as the source, so the Reader anchors scroll sync to segments instead of pixels — the panes stay aligned at the segment level no matter how the prose stretches. Press `t` to translate the focused segment, `Shift+T` for the whole chapter, `r` to bypass the cache. Position memory is per-project: leave the Reader, come back to the same scroll offset.
+
+### Batch mode — chapter-scoped or project-wide
+
+<p align="center">
+  <img src="docs/screenshots/05c-batch-modal-dashboard.png" alt="The Translate Batch modal pre-populated with 34 chapters (772 pending segments); concurrency = 4 (the curator's default); budget cap empty; helper-LLM pre-pass off. Cancel and Translate-34-chapters buttons sit at the bottom right." width="100%" />
+</p>
+
+Bounded concurrency, a hard budget cap, optional helper-LLM pre-pass per chapter, and AbortController-based cancel. Cache hits cost zero, so re-running a batch on a populated cache is free. Per-segment failures are isolated — one bad call doesn't sink the run.
+
+### LLM activity — a per-call audit ledger
+
+<p align="center">
+  <img src="docs/screenshots/14-llm-activity.png" alt="LLM activity screen showing a 100-call audit log: aggregate cost, prompt and completion token counts, cache-hit rate, and a scrollable list of recent calls each with model, timestamp, in/out token counts, and per-call cost." width="100%" />
+</p>
+
+Every prompt + response is logged to a per-project audit table with full token counts, cost, and cache status. Editing a glossary entry, the style guide, or the model invalidates exactly the segments whose cache key changed — nothing more, nothing less.
+
+### Project settings — every per-project knob in one place
+
+<p align="center">
+  <img src="docs/screenshots/09-project-settings.png" alt="The Project Settings page with cards for Identity, Style profile (literary fiction with the prose contract verbatim), Context window, Budget, and per-project LLM overrides. The save action is sticky in the header." width="100%" />
+</p>
+
+Style guide, context window, budget cap, and per-project LLM overrides — the same screen lets you rename the project (kept in sync with the Projects list) and swap the prose contract on the fly.
+
+> A complete tour with screenshots for every screen lives in [**docs/USAGE.md**](docs/USAGE.md). For an architectural deep dive, see [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md).
+
+---
+
 ## Highlights
 
 - **Sectioned navigation.** Library (Projects, Lore Books) is always visible; the Project section appears when a book is open and groups Dashboard, Reader, Glossary, Inbox, Project Settings, and the advanced views (LLM activity, Intake runs, Logs).
@@ -41,27 +79,39 @@ epublate fixes all four:
 - **Project bundles** — one-click `.zip` export with the original ePub plus every Dexie row as JSON-Lines, re-importable on any device with a fresh project id (so the same bundle can be imported multiple times without colliding).
 - **PWA-ready**: `vite-plugin-pwa` is wired; the app is installable and works offline (after the first load, cached LLM responses notwithstanding).
 - **Mock mode** (`?mock=1`) for demos and screenshots — every call goes through a deterministic provider and the cache so the UI is fully exercised without network access or API keys.
-- **Themes** — four built-in themes (Slate, Solarized, Midnight, Ledger), pickable from the sidebar footer.
+- **Themes** — four built-in themes (epublate, textual-dark, textual-light, high-contrast), pickable from the sidebar footer.
 
 ---
 
 ## 60-second tour
 
 ```bash
-git clone …/epublatejs && cd epublatejs
+git clone https://github.com/madpin/epublate-js.git && cd epublate-js
 npm install
 npm run dev                  # http://localhost:5173
 ```
 
 Then:
 
-1. Visit **Settings → LLM**, paste an OpenAI-compatible base URL + key, hit "Test connection". (Or skip this and append `?mock=1` to the URL for the deterministic mock provider.)
+1. Visit **Settings → LLM**, paste an OpenAI-compatible base URL + key, hit "Test connection". (Or skip this and append `?mock=1` to the URL for the deterministic mock provider — see the screenshot below.)
 2. From the **Projects** landing page, drop an ePub onto the dropzone or click "New project". Pick source / target language and a style preset.
 3. The **Dashboard** opens. Click "Translate batch" to run the helper-LLM pre-pass, then translate every pending segment with bounded concurrency and a budget cap. Or open the **Reader**, focus a segment, and press `t` to translate just that one.
 4. **Glossary** picks up proposed entries from the helper LLM and from the translator's `new_entities` field on every successful call. Approve or lock the ones you care about.
 5. When you're happy, click **Download ePub** on the Dashboard for a translated file, or **Download bundle** for the full project archive.
 
-For a deeper walk-through with screenshots and concept diagrams, see [**docs/USAGE.md**](docs/USAGE.md).
+<p align="center">
+  <img src="docs/screenshots/02-new-project-modal.png" alt="The New project modal with petitprince.epub already loaded, source language fr, target language en, the Literary fiction preset selected with its prose contract preview, and the helper-LLM auto-intake checkbox enabled." width="100%" />
+</p>
+
+For a deeper walk-through, see [**docs/USAGE.md**](docs/USAGE.md).
+
+### Try it without an LLM key
+
+`?mock=1` (or the toggle in Settings → LLM) swaps in a deterministic mock provider. Every screen behaves as if the real LLM had been called — the cache fills, the audit ledger fills, costs render at `$0.0000` — but no network call ever happens. Perfect for demos, screenshots, and CI smoke tests.
+
+```bash
+open "http://localhost:5173/?mock=1"
+```
 
 ---
 
@@ -81,6 +131,78 @@ For a deeper walk-through with screenshots and concept diagrams, see [**docs/USA
 `navigator.storage.persist()` is requested on first project create so the OS doesn't evict your work under storage pressure.
 
 The Settings screen lets you wipe the entire library DB and every per-project DB in one click ("Reset all data").
+
+---
+
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+  user([Curator])
+  subgraph browser["Browser tab (static SPA)"]
+    direction TB
+    ui["React UI<br/>(routes, AppShell, modals)"]
+    state["Zustand stores<br/>app · batch · ui · last_project"]
+    pipeline["core/<br/>pipeline · batch · extractor · cache"]
+    fmt["formats/epub<br/>loader · segmentation · writer"]
+    glossary["glossary/<br/>matcher · enforcer · cascade"]
+    llm["llm/<br/>OpenAICompat · Mock"]
+    dexie[("IndexedDB<br/>epublate-library<br/>epublate-project-&lt;id&gt;<br/>epublate-lore-&lt;id&gt;")]
+  end
+  external([OpenAI-compatible<br/>endpoint])
+
+  user --> ui
+  ui <--> state
+  ui --> pipeline
+  ui --> fmt
+  pipeline --> glossary
+  pipeline --> llm
+  pipeline <--> dexie
+  fmt <--> dexie
+  glossary <--> dexie
+  llm -. only egress .-> external
+```
+
+Per-project data lives in a **named Dexie database** (one per project), so deleting a project is a single `Dexie.delete(name)` and the IDB inspector shows one DB per project — directly mirroring the Python tool's one-`.epublate`-per-project SQLite layout. Lore Books follow the same pattern.
+
+```
+src/
+├── core/             pipeline, batch, extractor (helper LLM), style, project bundles, exports
+├── db/               Dexie schemas + repo layer (projects, segments, glossary, lore, library)
+├── formats/epub/     loader, segmentation, writer; round-trip identity is the invariant
+├── glossary/         matcher, enforcer, cascade, IO
+├── llm/              base, openai_compat, mock, factory, prompts (translator, extractor, …)
+├── lore/             lore book model + per-project attachment management
+├── routes/           one .tsx per screen; AppShell composes the sidebar + outlet
+├── components/       shadcn-style primitives (forms, dialogs, layout)
+└── state/            Zustand stores (app, ui, batch, last_project)
+```
+
+> The full architectural deep dive — including module-level mermaid diagrams, the cache-key recipe, the batch runner's pause/resume state machine, the translator-prompt recipe, and the byte-faithful ePub round-trip invariants — lives in [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md).
+
+---
+
+## Project bundles
+
+The Dashboard's **Download bundle** button produces `<name>.epublate-project.zip` with the original ePub plus every Dexie row as JSON-Lines. The Projects landing page has a matching **Import bundle** button that re-hydrates a previously-exported project into a fresh database with a new id, so the same bundle can be imported multiple times without colliding.
+
+```
+<name>.epublate-project.zip
+├── manifest.json          schema version, exported_at, project id
+├── project.json           single project row
+├── library_row.json       library-level metadata (size, progress, …)
+├── original.epub          verbatim source bytes
+├── chapters.jsonl         one JSON object per line
+├── segments.jsonl
+├── glossary.jsonl + glossary_aliases.jsonl + glossary_revisions.jsonl
+├── entity_mentions.jsonl
+├── llm_calls.jsonl        full LLM audit log (request + response)
+├── events.jsonl           append-only event stream
+├── intake_runs.jsonl + intake_run_entries.jsonl
+└── attached_lore.jsonl + lore_meta.jsonl + lore_sources.jsonl
+```
+
+Bundles are forward-compatible: older clients refuse newer schemas with a clear error instead of silently corrupting state.
 
 ---
 
@@ -124,53 +246,6 @@ The Settings screen lets you wipe the entire library DB and every per-project DB
 
 ---
 
-## Architecture (one diagram)
-
-<p align="center">
-  <img src="docs/diagrams/architecture.svg" alt="epublate architecture: UI → Zustand → core/pipeline → llm provider; UI → Dexie repo → per-project IndexedDB" width="100%" />
-</p>
-
-```
-src/
-├── core/             pipeline, batch, extractor (helper LLM), style, project bundles, exports
-├── db/               Dexie schemas + repo layer (projects, segments, glossary, lore, library)
-├── formats/epub/     loader, segmentation, writer; round-trip identity is the invariant
-├── glossary/         matcher, enforcer, IO
-├── llm/              base, openai_compat, mock, factory, prompts (translator, extractor, …)
-├── lore/             lore book model + per-project attachment management
-├── routes/           one .tsx per screen; AppShell composes the sidebar + outlet
-├── components/       shadcn-style primitives (forms, dialogs, layout)
-└── state/            Zustand stores (app, ui, batch)
-```
-
-Per-project data lives in a **named Dexie database** (one per project), so deleting a project is a single `Dexie.delete(name)` and the IDB inspector shows one DB per project — directly mirroring the Python tool's one-`.epublate`-per-project SQLite layout. Lore Books follow the same pattern.
-
----
-
-## Project bundles
-
-The Dashboard's **Download bundle** button produces `<name>.epublate-project.zip` with the original ePub plus every Dexie row as JSON-Lines. The Projects landing page has a matching **Import bundle** button that re-hydrates a previously-exported project into a fresh database with a new id, so the same bundle can be imported multiple times without colliding.
-
-```
-<name>.epublate-project.zip
-├── manifest.json          schema version, exported_at, project id
-├── project.json           single project row
-├── library_row.json       library-level metadata (size, progress, …)
-├── original.epub          verbatim source bytes
-├── chapters.jsonl         one JSON object per line
-├── segments.jsonl
-├── glossary.jsonl + glossary_aliases.jsonl + glossary_revisions.jsonl
-├── entity_mentions.jsonl
-├── llm_calls.jsonl        full LLM audit log (request + response)
-├── events.jsonl           append-only event stream
-├── intake_runs.jsonl + intake_run_entries.jsonl
-└── attached_lore.jsonl + lore_meta.jsonl + lore_sources.jsonl
-```
-
-Bundles are forward-compatible: older clients refuse newer schemas with a clear error instead of silently corrupting state.
-
----
-
 ## Tech stack
 
 | Layer            | Choice                                                                                |
@@ -187,6 +262,18 @@ Bundles are forward-compatible: older clients refuse newer schemas with a clear 
 | PWA              | [`vite-plugin-pwa`](https://vite-pwa-org.netlify.app/)                                |
 | Toasts           | [`sonner`](https://sonner.emilkowal.ski/)                                             |
 | Hotkeys          | [`react-hotkeys-hook`](https://github.com/JohannesKlauss/react-hotkeys-hook)          |
+| Screenshots      | [Playwright](https://playwright.dev) — driven by `tools/snap.mjs`                     |
+
+---
+
+## Documentation map
+
+| Doc                                                | What's in it                                                                                  |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| [`docs/USAGE.md`](docs/USAGE.md)                   | Hands-on tour of every screen with screenshots and concept tables.                            |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)     | Architectural deep dive: layers, modules, data flow, cache key, batch state machine, ePub round-trip. |
+| [`AGENTS.md`](AGENTS.md)                           | Hard invariants and conventions for AI agents (and humans) modifying the codebase.            |
+| [`docs/screenshots/README.md`](docs/screenshots/README.md) | How to capture / refresh the screenshots in mock mode.                                |
 
 ---
 
@@ -194,7 +281,7 @@ Bundles are forward-compatible: older clients refuse newer schemas with a clear 
 
 - Tests run on `vitest`; new behaviour wants a regression test next to the source (e.g. `src/core/pipeline.test.ts`). DB-touching tests use `fake-indexeddb`; round-trip ePub tests use `JSDOM`.
 - Architectural conventions and invariants live in [`AGENTS.md`](AGENTS.md). Read it before changing the segmentation pipeline or the cache key shape — both have hidden contracts the tests depend on.
-- The plan that scaffolded this port is at `~/.cursor/plans/epublate browser port-*.plan.md` (out of repo). Phase notes are preserved in commit history.
+- Screenshots are captured by `tools/snap.mjs` against a dev server running with `?mock=1`. Re-run it whenever a screen materially changes; the filenames are the doc contract.
 
 ---
 

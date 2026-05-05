@@ -1,0 +1,48 @@
+---
+description: Keep README, docs/, and the snap tool in sync with code changes.
+alwaysApply: true
+---
+
+# Doc set & screenshots
+
+The doc set is part of the deliverable, not an afterthought. The
+canonical files:
+
+- `README.md` — first-contact pitch, quickstart, hero screenshots.
+- `docs/ARCHITECTURE.md` — developer deep dive: modules, data flow,
+  mermaid diagrams, cache-key recipe, ePub round-trip invariants.
+- `docs/USAGE.md` — curator-side tour of every screen, screenshot per
+  feature.
+- `docs/screenshots/` — PNGs captured by `tools/snap.mjs` in `?mock=1`
+  mode. `docs/screenshots/README.md` is the capture-list contract;
+  filenames are stable.
+
+## When to refresh
+
+- **New screen / route.** Add a section to `docs/USAGE.md`, register
+  the capture in `tools/snap.mjs`, add the entry to the capture list in
+  `docs/screenshots/README.md`, and re-run `node tools/snap.mjs`
+  against a `npm run dev` server. If routing shifts, edit the route
+  diagram in `docs/ARCHITECTURE.md`.
+- **Existing screen materially changed** (layout, status copy, primary
+  CTA). Re-run the snap script for the affected filename(s); review
+  alt-text in README / USAGE.
+- **New module** under `src/core/`, `src/db/`, `src/glossary/`,
+  `src/llm/`, `src/lore/`, or `src/formats/` — add it to the code-
+  layout tree and the relevant subsystem section in
+  `docs/ARCHITECTURE.md`.
+- **New Dexie table, status enum, cache-key input, prompt input, or
+  bundle artifact** — update the matching section in
+  `docs/ARCHITECTURE.md` (and the bundle layout in `README.md`, if the
+  artifact is curator-visible).
+- **README front-page change** (value prop, hero shot, quickstart) —
+  keep the same claims true in `docs/USAGE.md` and the README must
+  still match the live UI.
+
+## Screenshot rules
+
+- Capture only via `tools/snap.mjs` in `?mock=1` mode. Never commit
+  screenshots taken against a real LLM endpoint — keys and costs leak.
+- The script resets every Dexie DB at start; if a new screen needs a
+  different seed, extend the script rather than capturing by hand.
+- Filenames are the contract — keep them stable across runs.
