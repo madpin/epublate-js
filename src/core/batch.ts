@@ -290,6 +290,13 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
       : options.budget_usd;
   const effective_style_guide =
     options.style_guide === undefined ? detail.style_guide : options.style_guide;
+  // Snapshot the project's book summary + prompt-block toggles once
+  // for the whole run. The pipeline could re-read them per segment,
+  // but the curator's expectation is "this batch uses the project
+  // settings as they were when I clicked Run" — same model as the
+  // glossary snapshot below.
+  const effective_book_summary = detail.book_summary ?? null;
+  const effective_prompt_options = detail.prompt_options ?? null;
 
   // Per-chapter note cache. We resolve once on demand (and only for
   // chapters that actually have pending segments) and reuse across
@@ -526,6 +533,8 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
               source_lang,
               target_lang,
               style_guide: effective_style_guide,
+              book_summary: effective_book_summary,
+              prompt_options: effective_prompt_options,
               chapter_notes,
               segment: seg,
               provider,

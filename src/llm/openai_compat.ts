@@ -542,10 +542,67 @@ export function explainFetchFailure(err: unknown, url: string): string {
   }
   if (/Failed to fetch|Load failed|NetworkError/i.test(msg)) {
     let hostname = url;
+    let scheme = "";
+    let is_loopback = false;
+    let is_private = false;
     try {
-      hostname = new URL(url).hostname;
+      const parsed = new URL(url);
+      hostname = parsed.hostname;
+      scheme = parsed.protocol; // "http:" / "https:"
+      is_loopback = isLoopbackHost(hostname);
+      is_private = is_loopback || isPrivateHost(hostname);
     } catch {
       /* keep raw url */
+    }
+    const page_origin = currentOrigin();
+    const page_is_https = page_origin?.startsWith("https://") ?? false;
+    const target_is_http = scheme === "http:";
+
+    // Mixed content / Private Network Access — most common deploy-time
+    // confusion: an HTTPS page on Vercel/Cloudflare/etc. trying to
+    // reach `http://localhost`. Browsers (Chrome especially) treat
+    // this as a Private Network Access cross-origin request that
+    // requires a server-side opt-in *and* CORS headers Ollama may
+    // not be returning by default. The original "Failed to fetch"
+    // message is too generic to debug from.
+    if (page_is_https && target_is_http && is_loopback) {
+      return (
+        `${msg} (the browser blocked the HTTPS page at ${describeOrigin(page_origin)} ` +
+        `from calling the plaintext loopback URL ${url}). This is a Private ` +
+        `Network Access / mixed-content rejection, not a bug in epublatejs. ` +
+        `Three known-good fixes: (1) run the SPA from http://localhost (e.g. ` +
+        `\`npm run dev\` or \`npm run preview\`), since loopback→loopback ` +
+        `over HTTP is allowed; (2) put Ollama behind an HTTPS reverse proxy ` +
+        `(\`tailscale serve --https=11434 http://127.0.0.1:11434\`, ` +
+        `\`cloudflared tunnel\`, \`ngrok http 11434\`) and paste the HTTPS ` +
+        `URL in Settings; (3) launch Chrome with PNA disabled — \`open -na ` +
+        `"Google Chrome" --args --disable-features=BlockInsecurePrivateNetworkRequests\`. ` +
+        `Confirm Ollama itself is reachable with: \`curl -i ` +
+        `${describeUrlOrigin(url) ?? "http://localhost:11434"}/v1/models\`.`
+      );
+    }
+    if (page_is_https && target_is_http && is_private) {
+      return (
+        `${msg} (the browser blocked the HTTPS page at ${describeOrigin(page_origin)} ` +
+        `from calling the plaintext private-network URL ${url}). This is a ` +
+        `Private Network Access / mixed-content rejection. Either move the ` +
+        `endpoint behind HTTPS (Tailscale, Cloudflare Tunnel, ngrok) or run ` +
+        `the SPA from http:// itself.`
+      );
+    }
+    if (is_loopback) {
+      return (
+        `${msg} (the browser blocked the request to ${url} — Ollama is ` +
+        `usually reachable on this address). Confirm \`ollama serve\` is ` +
+        `running and was launched with \`OLLAMA_ORIGINS=*\` (the env var ` +
+        `must be set on the *server* process; restart Ollama after ` +
+        `setting it). On macOS launchd, run ` +
+        `\`launchctl setenv OLLAMA_ORIGINS '*'\` then ` +
+        `\`launchctl kickstart -k user/$UID/com.ollama.ollama\`. Verify ` +
+        `with \`curl -H 'Origin: ${page_origin ?? "https://example.com"}' ` +
+        `-i http://localhost:11434/v1/models\` — the response must include ` +
+        `\`Access-Control-Allow-Origin\`.`
+      );
     }
     return (
       `${msg} (the browser blocked the request to ${hostname} — usually ` +
@@ -555,4 +612,51 @@ export function explainFetchFailure(err: unknown, url: string): string {
     );
   }
   return msg;
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "[::1]" ||
+    hostname === "::1"
+  );
+}
+
+function isPrivateHost(hostname: string): boolean {
+  // RFC 1918 + link-local + ULA. Cheap regex; we only use it for
+  // user-facing diagnostics so false negatives just fall through to
+  // the generic message.
+  return (
+    /^10\./.test(hostname) ||
+    /^192\.168\./.test(hostname) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
+    /^169\.254\./.test(hostname) ||
+    /^fe80:/i.test(hostname) ||
+    /^fc[0-9a-f]{2}:/i.test(hostname) ||
+    /^fd[0-9a-f]{2}:/i.test(hostname)
+  );
+}
+
+function currentOrigin(): string | null {
+  try {
+    if (typeof window !== "undefined" && window.location?.origin) {
+      return window.location.origin;
+    }
+  } catch {
+    /* swallow */
+  }
+  return null;
+}
+
+function describeOrigin(origin: string | null): string {
+  return origin ?? "this page";
+}
+
+function describeUrlOrigin(url: string): string | null {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
 }

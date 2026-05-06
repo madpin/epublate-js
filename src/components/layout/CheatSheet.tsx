@@ -45,6 +45,7 @@ const READER: HotkeyGroup = {
     { combo: "k / ↑", description: "Previous segment" },
     { combo: "t", description: "Translate the focused segment" },
     { combo: "Shift+T", description: "Translate the whole chapter" },
+    { combo: "Shift+P", description: "Toggle the prompt preview panel" },
     { combo: "a", description: "Accept the focused translation" },
     { combo: "e", description: "Edit the focused translation" },
     { combo: "r", description: "Re-translate (bypass cache)" },

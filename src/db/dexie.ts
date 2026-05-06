@@ -110,6 +110,18 @@ export class ProjectDb extends Dexie {
       embeddings:
         "id, scope, ref_id, model, [scope+ref_id+model], [scope+model], created_at",
     });
+    // v3: Configurable prompts + book/chapter summaries. Adds two
+    // optional fields to `projects` rows (`book_summary`,
+    // `prompt_options`) and two new `intake_runs.kind` literals
+    // (`book_summary`, `chapter_summary`). None of these new fields
+    // need their own index — `book_summary` is plain text, the
+    // `prompt_options` blob is JSON-shaped, and the new intake-run
+    // kinds piggy-back on the existing `kind` index. The empty
+    // `.stores()` call is a no-op upgrade that bumps the on-disk
+    // schema number so legacy databases re-open under v3 without
+    // losing data; legacy rows simply round-trip with the new
+    // optional columns absent (= treated as `null` by the read path).
+    this.version(3).stores({});
   }
 }
 

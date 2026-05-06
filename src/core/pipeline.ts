@@ -25,6 +25,10 @@ import { cacheKeyForMessages, EMPTY_GLOSSARY_HASH } from "@/core/cache";
 import { type ContextMode, isDialogueSegment } from "@/core/dialogue";
 import { type EmbeddingPrefetcher } from "@/core/embedding_prefetch";
 import {
+  resolvePromptOptions,
+  type PromptOptions,
+} from "@/core/prompt_options";
+import {
   findLlmCallByCacheKey,
   insertLlmCall,
 } from "@/db/repo/llm_calls";
@@ -239,6 +243,20 @@ export interface TranslateInput {
    * chapter and reuses them across segments.
    */
   chapter_notes?: string | null;
+  /**
+   * Project-level book summary, mirrored into the system prompt's
+   * `<book_summary>` block. Snapshotted by `runBatch` once per run
+   * (and pulled lazily from the project row when this caller wants
+   * to translate a single segment without going through the batch
+   * runner).
+   */
+  book_summary?: string | null;
+  /**
+   * Project-level translator-prompt toggles. When omitted, the
+   * pipeline reads them from the project row at the start of the
+   * call.
+   */
+  prompt_options?: PromptOptions | null;
   segment: Segment;
   provider: LLMProvider;
   options: TranslateOptions;
@@ -256,11 +274,40 @@ export interface TranslateInput {
 export async function translateSegment(
   input: TranslateInput,
 ): Promise<TranslateOutcome> {
-  const { project_id, source_lang, target_lang, style_guide, chapter_notes, segment, provider, options } = input;
+  const {
+    project_id,
+    source_lang,
+    target_lang,
+    style_guide,
+    chapter_notes,
+    segment,
+    provider,
+    options,
+  } = input;
 
   if (isTriviallyEmpty(segment.source_text)) {
     return shortCircuitTrivial({ project_id, segment });
   }
+
+  // `book_summary` and `prompt_options` are project-stable. Callers
+  // that come through `runBatch` snapshot them once per run; ad-hoc
+  // single-segment callers (Reader's "translate this segment" button,
+  // tests, REPL) pass them via the input. Either way, we read them
+  // from the project row here when missing so a hand-driven call
+  // matches the batch path's behaviour exactly.
+  let book_summary = input.book_summary;
+  let prompt_options = input.prompt_options;
+  if (book_summary === undefined || prompt_options === undefined) {
+    const db = openProjectDb(project_id);
+    const project_row = await db.projects.get(project_id);
+    if (book_summary === undefined) {
+      book_summary = project_row?.book_summary ?? null;
+    }
+    if (prompt_options === undefined) {
+      prompt_options = project_row?.prompt_options ?? null;
+    }
+  }
+  const resolved_prompt_options = resolvePromptOptions(prompt_options ?? null);
 
   // Phase 2 + 3: best-effort segment-source embedding. The vector is
   // reused for two things in this call: (a) Lore-Book top-K
@@ -373,11 +420,13 @@ export async function translateSegment(
     target_lang,
     source_text: segment.source_text,
     style_guide: style_guide ?? null,
+    book_summary: book_summary ?? null,
     chapter_notes: chapter_notes ?? null,
     glossary: projected,
     target_only_glossary: targetOnly,
     proposed_hints_block,
     context,
+    prompt_options: resolved_prompt_options,
   });
 
   const baseKey = await cacheKeyForMessages({
@@ -1365,5 +1414,264 @@ async function persistSegmentEmbedding(
     // Persistence failures here are non-fatal; the next translateSegment
     // call will simply re-embed.
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* previewSegmentPrompt — dry-run helper for the simulator + Reader   */
+/* preview panel. Mirrors the assembly path in `translateSegment`     */
+/* but never calls the provider and never writes to the DB.           */
+/* ------------------------------------------------------------------ */
+
+export interface PreviewSegmentPromptInput {
+  project_id: string;
+  source_lang: string;
+  target_lang: string;
+  segment: Segment;
+  /** Project-wide style guide. Pulled from the project row when omitted. */
+  style_guide?: string | null;
+  /** Optional curator chapter notes. Pulled from the chapter row when omitted. */
+  chapter_notes?: string | null;
+  /** Project-level book summary. Pulled from the project row when omitted. */
+  book_summary?: string | null;
+  /** Resolved {@link PromptOptions} after applying any what-if overrides. */
+  prompt_options?: PromptOptions | null;
+  /**
+   * The slug the curator would translate against. The wire payload
+   * never carries a model in the chat messages, but the cache key
+   * does — surfacing the right slug here means the preview's
+   * cache-status badge matches what `translateSegment` would compute.
+   */
+  model: string;
+  /**
+   * Optional embedding provider — unlocks `proposed_hints` and the
+   * `relevant` context picker. When omitted the preview falls back
+   * to `previous` context mode just like a no-embedding configured
+   * project would.
+   */
+  embedding_provider?: EmbeddingProvider | null;
+  /** Optional override for context selection (otherwise read from project). */
+  context?: ContextOptions | null;
+  /** Optional override for proposed-hint retrieval. */
+  proposed_hints?: ProposedHintsRetrievalOptions | null;
+  /** Optional override for the glossary state (defaults to the project's). */
+  glossary_state?: readonly GlossaryEntryWithAliases[] | null;
+  signal?: AbortSignal;
+}
+
+export interface PreviewSegmentPromptResult {
+  /** Final assembled `{role, content}` array — exactly what would be sent. */
+  messages: ReturnType<typeof buildTranslatorMessages>;
+  /** System-prompt string (the cacheable prefix). */
+  system_text: string;
+  /** User-prompt string (the volatile per-segment tail). */
+  user_text: string;
+  /** Total prompt-token estimate (system + user). */
+  prompt_tokens: number;
+  /** Per-message prompt-token estimates. */
+  prompt_tokens_by_message: number[];
+  /** Cache key as `translateSegment` would compute it. */
+  cache_key: string;
+  /** Glossary content hash folded into the cache key. */
+  glossary_hash: string;
+  /** True when an `llm_calls` row already exists for this cache key. */
+  cache_hit: boolean;
+  /** Resolved prompt options actually applied to this preview. */
+  prompt_options: PromptOptions;
+  /** Glossary entries projected into the prompt's `<glossary>` block. */
+  glossary: readonly GlossaryConstraint[];
+  /** Target-only entries projected into the prompt's `<target_only_terms>` block. */
+  target_only: readonly TargetOnlyConstraint[];
+  /** Context segments selected for `<recent_context>` (post-mode rules). */
+  context: readonly ContextSegment[];
+  /** Proposed-hint glossary IDs surfaced in `<proposed_terms>`. */
+  proposed_hints_used: readonly string[];
+}
+
+/**
+ * Build the exact prompt `translateSegment` would send for a given
+ * segment, without calling the provider. Used by:
+ *
+ *   - the Project Settings prompt simulator card (Phase 3),
+ *   - the Reader-side prompt preview panel (Phase 4),
+ *   - the on-demand "what would change?" tooltip after toggling a
+ *     `PromptOptions` flag.
+ *
+ * Re-runs the same code paths as the live pipeline (lore retrieval,
+ * proposed hint picking, context selection) so the preview is
+ * byte-equivalent to what would actually go on the wire. The only
+ * differences from `translateSegment`:
+ *
+ *   - never writes to `embeddings` (still reads cached vectors),
+ *   - never writes to `llm_calls` or `events`,
+ *   - never calls `provider.chat()`.
+ */
+export async function previewSegmentPrompt(
+  input: PreviewSegmentPromptInput,
+): Promise<PreviewSegmentPromptResult> {
+  const {
+    project_id,
+    source_lang,
+    target_lang,
+    segment,
+    embedding_provider = null,
+  } = input;
+
+  const db = openProjectDb(project_id);
+  const project_row = await db.projects.get(project_id);
+  const style_guide =
+    input.style_guide !== undefined
+      ? input.style_guide
+      : (project_row?.style_guide ?? null);
+  const book_summary =
+    input.book_summary !== undefined
+      ? input.book_summary
+      : (project_row?.book_summary ?? null);
+  const prompt_options =
+    input.prompt_options !== undefined
+      ? input.prompt_options
+      : (project_row?.prompt_options ?? null);
+  const resolved_prompt_options = resolvePromptOptions(prompt_options);
+
+  let chapter_notes = input.chapter_notes;
+  if (chapter_notes === undefined) {
+    const chapter_row = await db.chapters.get(segment.chapter_id);
+    chapter_notes = chapter_row?.notes ?? null;
+  }
+
+  // Re-use a cached vector when present so the preview lights up
+  // proposed hints / relevant context without making an embedding
+  // call. We never write the vector back from this path — that's
+  // the job of the live translate flow.
+  let segment_vec: Float32Array | null = null;
+  let embedding_model_used: string | null = null;
+  if (embedding_provider) {
+    try {
+      const cached = await getEmbedding(
+        "project",
+        project_id,
+        "segment",
+        segment.id,
+        embedding_provider.model,
+      );
+      if (cached) {
+        segment_vec = unpackFloat32(cached.vector);
+        embedding_model_used = embedding_provider.model;
+      } else {
+        // Best-effort live embed for the preview only — never persisted.
+        const result = await embedding_provider.embed(
+          [segment.source_text],
+          input.signal,
+        );
+        const v = result.vectors[0];
+        if (v) {
+          segment_vec = v;
+          embedding_model_used = embedding_provider.model;
+        }
+      }
+    } catch {
+      segment_vec = null;
+    }
+  }
+
+  const project_glossary = input.glossary_state
+    ? [...input.glossary_state]
+    : await (async () => {
+        const { listGlossaryEntries } = await import("@/db/repo/glossary");
+        return listGlossaryEntries(project_id);
+      })();
+  const projected = buildConstraints(project_glossary);
+  const target_only = buildTargetOnlyConstraints(project_glossary);
+  const glossary_hash_value = project_glossary.length
+    ? await computeGlossaryHash(project_glossary)
+    : EMPTY_GLOSSARY_HASH;
+
+  let proposed_hints_block = "";
+  let proposed_hints_used: readonly string[] = [];
+  if (segment_vec && embedding_model_used) {
+    const hints = await retrieveProposedHints({
+      project_id,
+      segment_vec,
+      embedding_model: embedding_model_used,
+      project_glossary,
+      options: input.proposed_hints ?? null,
+    });
+    proposed_hints_block = hints.block;
+    proposed_hints_used = hints.used_ids;
+  }
+
+  const context = await collectContextSegments({
+    project_id,
+    segment,
+    options: input.context ?? null,
+    embedding_context:
+      segment_vec && embedding_model_used
+        ? {
+            segment_vec,
+            embedding_model: embedding_model_used,
+          }
+        : null,
+  });
+
+  const messages = buildTranslatorMessages({
+    source_lang,
+    target_lang,
+    source_text: segment.source_text,
+    style_guide: style_guide ?? null,
+    book_summary: book_summary ?? null,
+    chapter_notes: chapter_notes ?? null,
+    glossary: projected,
+    target_only_glossary: target_only,
+    proposed_hints_block,
+    context,
+    prompt_options: resolved_prompt_options,
+  });
+
+  const baseKey = await cacheKeyForMessages({
+    model: input.model,
+    messages,
+    glossary_hash: glossary_hash_value,
+  });
+  // The simulator never bypasses the cache — it surfaces the *real*
+  // cache key so the curator knows what would happen on a live call.
+  const cache_key = baseKey;
+  const hit = await findLlmCallByCacheKey(project_id, cache_key);
+
+  // Lazy-import the tokenizer so the simulator can be loaded in
+  // routes that don't otherwise touch the heavy gpt-tokenizer
+  // entry point.
+  const { countTokensSync } = await import("@/llm/tokens");
+  const prompt_tokens_by_message = messages.map((m) => {
+    const text = typeof m.content === "string" ? m.content : "";
+    return Math.max(0, countTokensSync(text));
+  });
+  const prompt_tokens = prompt_tokens_by_message.reduce((a, b) => a + b, 0);
+  const system_msg = messages.find((m) => m.role === "system");
+  const user_msg = messages.find((m) => m.role === "user");
+  const system_text = system_msg
+    ? typeof system_msg.content === "string"
+      ? system_msg.content
+      : ""
+    : "";
+  const user_text = user_msg
+    ? typeof user_msg.content === "string"
+      ? user_msg.content
+      : ""
+    : "";
+
+  return {
+    messages,
+    system_text,
+    user_text,
+    prompt_tokens,
+    prompt_tokens_by_message,
+    cache_key,
+    glossary_hash: glossary_hash_value,
+    cache_hit: Boolean(hit),
+    prompt_options: resolved_prompt_options,
+    glossary: projected,
+    target_only,
+    context,
+    proposed_hints_used,
+  };
 }
 

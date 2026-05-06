@@ -21,6 +21,7 @@ import {
   type LibraryProjectRow,
   type ProjectKindT,
   type ProjectRow,
+  type PromptOptions,
   ProjectKind,
 } from "../schema";
 
@@ -200,6 +201,17 @@ export interface UpdateProjectSettingsPatch {
   context_relevant_min_similarity?: number | null;
   /** Pass an object to set, or `null` to clear. Will be JSON-stringified. */
   llm_overrides?: object | null;
+  /**
+   * Project-wide narrative summary; injected into the translator
+   * prompt's `<book_summary>` block. Pass `null` (or empty after
+   * trim) to clear it.
+   */
+  book_summary?: string | null;
+  /**
+   * Per-project translator-prompt toggles. Pass `null` to fall back
+   * to the documented defaults; pass a `PromptOptions` to override.
+   */
+  prompt_options?: PromptOptions | null;
 }
 
 export async function updateProjectSettings(
@@ -229,6 +241,13 @@ export async function updateProjectSettings(
     project_patch.llm_overrides = patch.llm_overrides
       ? JSON.stringify(patch.llm_overrides)
       : null;
+  }
+  if (patch.book_summary !== undefined) {
+    const cleaned = patch.book_summary?.trim();
+    project_patch.book_summary = cleaned ? cleaned : null;
+  }
+  if (patch.prompt_options !== undefined) {
+    project_patch.prompt_options = patch.prompt_options;
   }
   if (Object.keys(project_patch).length === 0) return;
   await db.transaction("rw", db.projects, db.events, async () => {

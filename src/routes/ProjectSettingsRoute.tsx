@@ -23,7 +23,7 @@
  */
 
 import * as React from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useParams } from "react-router-dom";
 import { useLiveQuery } from "dexie-react-hooks";
 import { ArrowLeft, Save, Settings as SettingsIcon } from "lucide-react";
 import { toast } from "sonner";
@@ -54,7 +54,12 @@ import {
   getProfile,
   listProfiles,
 } from "@/core/style";
+import { resolvePromptOptions } from "@/core/prompt_options";
+import { BookSummaryCard } from "@/components/settings/BookSummaryCard";
+import { ChapterSummariesCard } from "@/components/settings/ChapterSummariesCard";
 import { EmbeddingInventoryCard } from "@/components/settings/EmbeddingInventoryCard";
+import { PromptOptionsCard } from "@/components/settings/PromptOptionsCard";
+import { PromptSimulatorCard } from "@/components/settings/PromptSimulatorCard";
 import { openProjectDb } from "@/db/dexie";
 import { libraryDb } from "@/db/library";
 import { updateProjectSettings } from "@/db/repo/projects";
@@ -134,7 +139,29 @@ export function ProjectSettingsRoute(): React.JSX.Element {
 
   const [form, setForm] = React.useState<FormState>(EMPTY_FORM);
   const [busy, setBusy] = React.useState(false);
+  const [promptRefreshToken, setPromptRefreshToken] = React.useState(0);
   const initial_loaded = React.useRef(false);
+  const location = useLocation();
+
+  // Honor deep-link hashes like `#book-summary`, `#prompt-options`, or
+  // `#chapter-summaries`. The first paint races the data fetch, so
+  // re-scroll once the cards are in the tree (i.e. after `detail` and
+  // the project chapters have loaded). Best-effort: if the curator
+  // scrolls before the second tick, we don't fight them.
+  const last_hash_ref = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (!location.hash) return;
+    if (last_hash_ref.current === location.hash) return;
+    const id = location.hash.slice(1);
+    const handle = window.setTimeout(() => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+        last_hash_ref.current = location.hash;
+      }
+    }, 60);
+    return () => window.clearTimeout(handle);
+  }, [location.hash, detail, projectId]);
   /**
    * Snapshot of the persisted embedding override (provider, model,
    * dim) at load time. Compared against the form values on save so
@@ -504,6 +531,33 @@ export function ProjectSettingsRoute(): React.JSX.Element {
             </div>
           </CardContent>
         </Card>
+
+        <PromptOptionsCard
+          project_id={projectId}
+          value={detail.prompt_options}
+          on_change={() => setPromptRefreshToken((n) => n + 1)}
+        />
+
+        <BookSummaryCard
+          project_id={projectId}
+          value={detail.book_summary}
+          block_enabled={
+            resolvePromptOptions(detail.prompt_options).include_book_summary
+          }
+        />
+
+        <ChapterSummariesCard
+          project_id={projectId}
+          block_enabled={
+            resolvePromptOptions(detail.prompt_options).include_chapter_notes
+          }
+        />
+
+        <PromptSimulatorCard
+          project_id={projectId}
+          prompt_options={detail.prompt_options}
+          refresh_token={promptRefreshToken}
+        />
 
         <Card>
           <CardHeader>

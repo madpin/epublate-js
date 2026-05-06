@@ -208,6 +208,7 @@ export function SettingsRoute(): React.JSX.Element {
                 onChange={(e) => setBaseUrl(e.target.value)}
                 placeholder="https://api.openai.com/v1"
               />
+              <MixedContentWarning base_url={base_url} />
             </div>
             <div className="grid gap-2">
               <Label htmlFor="api_key">API key</Label>
@@ -694,6 +695,82 @@ function PricingCard(): React.JSX.Element {
         ) : null}
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * Inline warning shown under the Base URL when the curator has the
+ * SPA running on an HTTPS page (typical Vercel / Cloudflare deploy)
+ * *and* the LLM endpoint is plaintext loopback. Browsers reject this
+ * as a Private Network Access / mixed-content violation long before
+ * Ollama ever sees the request, so the curator-friendly thing to do
+ * is flag it before they hit "Test connection" and stare at a
+ * confusing "Failed to fetch" toast.
+ *
+ * Pure UX layer — no behaviour change. The actual fetch path in
+ * `openai_compat.ts` produces an even more detailed message after the
+ * failure (origin, copy-pastable curl, three known fixes).
+ */
+function MixedContentWarning({
+  base_url,
+}: {
+  base_url: string;
+}): React.JSX.Element | null {
+  // Stable across renders — derives only from the typed URL and the
+  // page's origin, both of which are safe to read on every render.
+  const trimmed = base_url.trim();
+  if (trimmed === "") return null;
+  let target_scheme = "";
+  let target_host = "";
+  try {
+    const parsed = new URL(trimmed);
+    target_scheme = parsed.protocol;
+    target_host = parsed.hostname;
+  } catch {
+    return null;
+  }
+  if (target_scheme !== "http:") return null;
+  const is_loopback =
+    target_host === "localhost" ||
+    target_host === "127.0.0.1" ||
+    target_host === "::1" ||
+    target_host === "[::1]";
+  if (!is_loopback) return null;
+  const page_origin =
+    typeof window !== "undefined" ? window.location?.origin ?? "" : "";
+  if (!page_origin.startsWith("https://")) return null;
+
+  return (
+    <p
+      role="status"
+      className="rounded-md border border-amber-300/40 bg-amber-50/70 px-3 py-2 text-xs leading-relaxed text-amber-900 dark:border-amber-500/30 dark:bg-amber-950/30 dark:text-amber-200"
+    >
+      <strong className="font-semibold">Mixed-content warning.</strong>{" "}
+      This page is served over <code>https://</code>, so the browser
+      will refuse to call <code>{trimmed}</code> directly — that's a{" "}
+      Private Network Access / mixed-content rejection, not a bug in
+      epublatejs. Use one of:{" "}
+      <ol className="mt-1 list-decimal space-y-0.5 pl-5">
+        <li>
+          Run the SPA from <code>http://localhost</code> (e.g.{" "}
+          <code>npm run dev</code> or <code>npm run preview</code>).
+        </li>
+        <li>
+          Tunnel Ollama through HTTPS (
+          <code>tailscale serve --https=11434 http://127.0.0.1:11434</code>
+          , <code>cloudflared tunnel</code>, or <code>ngrok http 11434</code>
+          ) and paste the HTTPS URL here.
+        </li>
+        <li>
+          Launch a dev Chrome with PNA disabled —{" "}
+          <code>
+            open -na "Google Chrome" --args
+            --disable-features=BlockInsecurePrivateNetworkRequests
+          </code>
+          .
+        </li>
+      </ol>
+    </p>
   );
 }
 

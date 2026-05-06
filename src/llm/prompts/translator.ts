@@ -10,9 +10,25 @@
  * Inline tags never reach the model — `buildTranslatorMessages` assumes
  * the caller has already replaced them with `[[T0]]…[[/T0]]`
  * placeholders via `@/formats/epub/segmentation`.
+ *
+ * Cache architecture (Phase 1 of the configurable-prompts work):
+ *
+ *   The system message holds only the *project-stable* blocks (rules,
+ *   language notes, style guide, book summary, glossary, target-only
+ *   terms). Everything that varies per segment — chapter notes,
+ *   proposed-term hints, recent context, and the source text itself —
+ *   moves into a structured XML user message. That keeps the system
+ *   prefix byte-stable across every segment in a chapter so OpenAI's
+ *   automatic prompt cache (and Anthropic's prompt-caching beta, and
+ *   Ollama's KV-cache reuse) reuse roughly 80 % of the input-token
+ *   compute on segments 2..N.
  */
 
 import { type Message, LLMResponseError } from "@/llm/base";
+import {
+  resolvePromptOptions,
+  type PromptOptions,
+} from "@/core/prompt_options";
 
 export type GlossaryStatus = "proposed" | "confirmed" | "locked";
 export type GenderTag =
@@ -71,6 +87,13 @@ const SYSTEM_PROMPT_TEMPLATE = `You are a literary translator working on a long 
 
 Translate the user's source segment from {source_lang} to {target_lang}.
 
+The user message is structured as XML. The block under \`<source>\` is
+the segment to translate; treat \`<chapter_notes>\`, \`<proposed_terms>\`,
+and \`<recent_context>\` as advisory context that you MUST NOT translate
+or echo back. Translate ONLY the contents of \`<source>\` and return your
+translation in the JSON \`target\` field described at the bottom of this
+prompt.
+
 Hard rules — these are not negotiable:
 
 1. Inline formatting is encoded as opaque placeholders of the form
@@ -87,7 +110,7 @@ Hard rules — these are not negotiable:
    typographic patterns are language-specific, so do NOT mechanically
    transcribe source-side punctuation that has no equivalent in the
    target. When this run's source/target pair has known pitfalls,
-   they are listed under "Language-pair notes" below.
+   they are listed under \`<language_notes>\` below.
 3. Translate every textual passage end-to-end. Embedded quotations
    (even when wrapped in placeholder pairs that mark italics or
    blockquote runs), bracketed asides like \`[sic]\` / \`[Emphasis
@@ -98,13 +121,14 @@ Hard rules — these are not negotiable:
    proper name. If you would normally render a cited title as a
    parallel-text bilingual quote, instead translate it inline like
    the rest of the text and let the curator add a footnote later.
-4. Preserve the leading and trailing whitespace of the source segment
-   verbatim. If the source begins with newlines and indentation
-   (e.g. \`"\\n    [[T0]]…"\`) your target MUST begin with the same
-   characters; same for trailing whitespace. Do not strip, collapse,
-   or "tidy" the surrounding whitespace.
+4. Preserve the leading and trailing whitespace of the contents of
+   \`<source>\` verbatim. If the source begins with newlines and
+   indentation (e.g. \`"\\n    [[T0]]…"\`) your target MUST begin with
+   the same characters; same for trailing whitespace. Do not strip,
+   collapse, or "tidy" the surrounding whitespace, and do NOT include
+   the \`<source>\` tag itself in the target.
 5. Keep proper nouns, place names, and domain terms consistent across
-   the book. The glossary below lists agreed translations.
+   the book. The \`<glossary>\` block below lists agreed translations.
 6. Locked glossary entries are non-negotiable. Confirmed entries are
    strong defaults. Proposed entries are suggestions.
 7. Apply a glossary entry only when the source term is used in the
@@ -133,15 +157,15 @@ Hard rules — these are not negotiable:
    words like \`"na na Europa"\` or \`"the the Senate"\`. When the
    entry HAS a leading article on both sides, treat the article as
    part of the canonical spelling and do not add another one.
-10. The "Proposed terms (unvetted hints)" block, when present,
-    lists curator-uncurated suggestions surfaced for this segment by
-    semantic similarity. Apply them only when they fit the source's
-    meaning and the target audience; you may diverge if a better
-    translation exists in this context. **Do NOT include a proposed
-    term in \`used_entries\`** — that field is for locked / confirmed
-    entries only.
+10. The \`<proposed_terms unvetted="true">\` block, when present in
+    the user message, lists curator-uncurated suggestions surfaced
+    for this segment by semantic similarity. Apply them only when
+    they fit the source's meaning and the target audience; you may
+    diverge if a better translation exists in this context. **Do
+    NOT include a proposed term in \`used_entries\`** — that field
+    is for locked / confirmed entries only.
 
-{language_notes_block}{style_guide_block}{chapter_notes_block}{glossary_block}{target_only_block}{proposed_hints_block}{context_block}Respond with a single JSON object and nothing else:
+{language_notes_block}{style_guide_block}{book_summary_block}{glossary_block}{target_only_block}Respond with a single JSON object and nothing else:
 
 {
   "target": "<translated text with placeholders preserved>",
@@ -178,6 +202,13 @@ items from a table of contents, glossary, list, index, or other
 repetitive structure) so you can translate them in a single round-trip.
 Translate each segment from {source_lang} to {target_lang}.
 
+The user message is wrapped in XML envelope tags. The \`<items>\` block
+contains a JSON object of the shape
+\`{"items": [{"id": 1, "source": "..."}, ...]}\`; treat
+\`<book_summary>\` and any other context block as advisory only and do
+NOT translate or echo it. Translate ONLY the JSON contents of
+\`<items>\`.
+
 Hard rules — these are not negotiable:
 
 1. Preserve the number and order of items. Your response's
@@ -193,7 +224,7 @@ Hard rules — these are not negotiable:
    similar typographic patterns are language-specific, so do NOT
    mechanically transcribe source-side punctuation that has no
    equivalent in the target. When this run's source/target pair has
-   known pitfalls, they are listed under "Language-pair notes" below.
+   known pitfalls, they are listed under \`<language_notes>\` below.
 4. Translate every textual passage end-to-end. Embedded quotations,
    bracketed asides, parenthetical clauses, footnote text, and
    book / article titles cited inside an item are all part of that
@@ -204,9 +235,9 @@ Hard rules — these are not negotiable:
    verbatim in the matching target. Do not strip, collapse, or
    "tidy" surrounding whitespace.
 6. Keep proper nouns, place names, and domain terms consistent with
-   the glossary below. Locked glossary entries are non-negotiable,
-   confirmed entries are strong defaults, proposed entries are
-   suggestions.
+   the \`<glossary>\` block below. Locked glossary entries are
+   non-negotiable, confirmed entries are strong defaults, proposed
+   entries are suggestions.
 7. Apply a glossary entry only when the source term is used in the
    same sense as the entry. When the source uses the same word in an
    ordinary, unrelated sense, translate it idiomatically and ignore
@@ -239,9 +270,7 @@ Hard rules — these are not negotiable:
     opener (\`[[T0]]\`). Placeholder ids are local to each item — do
     not share or shift them across items.
 
-{language_notes_block}{style_guide_block}{glossary_block}{target_only_block}Input format: the user message is a JSON object of the shape
-\`{"items": [{"id": 1, "source": "..."}, ...]}\`. Respond with a
-single JSON object and nothing else:
+{language_notes_block}{style_guide_block}{book_summary_block}{glossary_block}{target_only_block}Respond with a single JSON object and nothing else:
 
 {
   "translations": [
@@ -487,15 +516,21 @@ function formatLanguagePairNotes(
   const src = lookupLangNote(source_lang, SOURCE_LANG_NOTES);
   const tgt = lookupLangNote(target_lang, TARGET_LANG_NOTES);
   if (!src && !tgt) return "";
-  const lines: string[] = [`Language-pair notes (${source_lang} → ${target_lang}):`];
+  const lines: string[] = [
+    "<language_notes>",
+    `Language-pair notes (${source_lang} → ${target_lang}):`,
+  ];
   if (src) lines.push(`  - When translating FROM ${source_lang}: ${src}`);
   if (tgt) lines.push(`  - When translating TO ${target_lang}: ${tgt}`);
+  lines.push("</language_notes>");
   lines.push("");
   return `${lines.join("\n")}\n`;
 }
 
 function formatGlossaryBlock(glossary: readonly GlossaryConstraint[]): string {
-  if (!glossary.length) return "Glossary: (empty for this segment).\n\n";
+  if (!glossary.length) {
+    return "<glossary>\n  (empty for this segment)\n</glossary>\n\n";
+  }
   const buckets: Record<GlossaryStatus, GlossaryConstraint[]> = {
     locked: [],
     confirmed: [],
@@ -506,11 +541,13 @@ function formatGlossaryBlock(glossary: readonly GlossaryConstraint[]): string {
     buckets[s] = buckets[s] ?? [];
     buckets[s].push(entry);
   }
-  const lines: string[] = ["Glossary:"];
+  const lines: string[] = ["<glossary>"];
   for (const status of ["locked", "confirmed", "proposed"] as const) {
     const bucket = buckets[status];
     if (!bucket.length) continue;
-    lines.push(`  ${status} entries (must use the canonical target term):`);
+    lines.push(
+      `  <${status}>  <!-- must use the canonical target term -->`,
+    );
     for (const entry of bucket) {
       const gender_marker =
         entry.gender && entry.gender !== "unspecified"
@@ -522,7 +559,9 @@ function formatGlossaryBlock(glossary: readonly GlossaryConstraint[]): string {
         `    - [${type}] ${entry.source_term} → ${entry.target_term}${gender_marker}${note}`,
       );
     }
+    lines.push(`  </${status}>`);
   }
+  lines.push("</glossary>");
   lines.push("");
   return `${lines.join("\n")}\n`;
 }
@@ -542,6 +581,7 @@ function formatTargetOnlyBlock(
     buckets[s].push(entry);
   }
   const lines: string[] = [
+    "<target_only_terms>",
     "Canonical target terms used in this work (no source spelling on file):",
   ];
   let has_any = false;
@@ -569,32 +609,79 @@ function formatTargetOnlyBlock(
     }
   }
   if (!has_any) return "";
-  lines.push("");
   lines.push(
     "If you encounter a source-language term in this segment that names " +
       "one of the entities above, you MUST translate it using the canonical " +
       "target form. If no source term in this segment maps to one of these " +
       "entities, ignore this list entirely.",
   );
+  lines.push("</target_only_terms>");
   lines.push("");
   return `${lines.join("\n")}\n`;
 }
 
-function formatContextBlock(context: readonly ContextSegment[]): string {
+function formatStyleGuideBlock(style_guide: string | null | undefined): string {
+  const trimmed = style_guide?.trim();
+  if (!trimmed) return "";
+  return `<style_guide>\n${trimmed}\n</style_guide>\n\n`;
+}
+
+function formatBookSummaryBlock(
+  book_summary: string | null | undefined,
+): string {
+  const trimmed = book_summary?.trim();
+  if (!trimmed) return "";
+  return `<book_summary>\n${trimmed}\n</book_summary>\n\n`;
+}
+
+function formatChapterNotesBlock(
+  chapter_notes: string | null | undefined,
+): string {
+  const trimmed = chapter_notes?.trim();
+  if (!trimmed) return "";
+  return `<chapter_notes>\n${trimmed}\n</chapter_notes>\n`;
+}
+
+function formatProposedHintsUserBlock(
+  proposed_hints_body: string | null | undefined,
+): string {
+  const trimmed = proposed_hints_body?.trim();
+  if (!trimmed) return "";
+  return `<proposed_terms unvetted="true">\n${trimmed}\n</proposed_terms>\n`;
+}
+
+function formatRecentContextBlock(
+  context: readonly ContextSegment[],
+): string {
   if (!context.length) return "";
   const ordered = [...context].sort((a, b) => b.segments_back - a.segments_back);
-  const lines: string[] = [
-    "Preceding segments (context only — DO NOT translate them; " +
-      "translate ONLY the user's segment below):",
-  ];
+  const lines: string[] = ["<recent_context>"];
   for (const entry of ordered) {
     const src = entry.source_text.trim() || "(empty)";
     const tgt = entry.target_text?.trim() || "(not yet translated)";
-    lines.push(`  - source: ${src}`);
-    lines.push(`    target: ${tgt}`);
+    const back = Math.max(0, entry.segments_back);
+    const back_attr = back > 0 ? ` back="${back}"` : "";
+    lines.push(`  <segment${back_attr}>`);
+    lines.push(`    <source>${escapeForXml(src)}</source>`);
+    lines.push(`    <target>${escapeForXml(tgt)}</target>`);
+    lines.push("  </segment>");
   }
+  lines.push("</recent_context>");
   lines.push("");
   return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Minimal XML escaping for context-only fields. We never put curator
+ * source text inside attributes, so escaping `<` / `>` / `&` is
+ * enough to keep the XML envelope unambiguous; the LLM doesn't care
+ * about full XML 1.1 entity expansion (it reads the value as plain
+ * text once it spots the surrounding tags).
+ */
+function escapeForXml(text: string): string {
+  return text.replace(/[&<>]/g, (c) =>
+    c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;",
+  );
 }
 
 export interface BuildTranslatorMessagesInput {
@@ -603,22 +690,36 @@ export interface BuildTranslatorMessagesInput {
   source_text: string;
   style_guide?: string | null;
   /**
-   * Curator-authored chapter notes, injected verbatim ahead of the
-   * glossary block. Use this for POV switches, recurring imagery, or
-   * scene-level disambiguations that the model can't infer from the
-   * segment alone. Trimmed to keep stale whitespace out of the cache
-   * key.
+   * Project-level book summary (~150-250 words). Injected as a stable
+   * `<book_summary>` block in the system message so OpenAI's prefix
+   * cache can reuse the prefix across every segment in the chapter.
+   * Trimmed to keep stale whitespace out of the cache key.
+   */
+  book_summary?: string | null;
+  /**
+   * Curator-authored chapter notes. Surfaces as `<chapter_notes>` in
+   * the user message — keeping it on the volatile side means the
+   * stable system prefix doesn't break when the curator edits a
+   * chapter's notes mid-book.
    */
   chapter_notes?: string | null;
   glossary?: readonly GlossaryConstraint[];
   target_only_glossary?: readonly TargetOnlyConstraint[];
   context?: readonly ContextSegment[];
   /**
-   * Phase 4: pre-formatted "proposed terms (unvetted hints)" block.
-   * Built upstream by `buildProposedHints`. Pass an empty string (or
-   * omit) to drop the section entirely.
+   * Pre-formatted body of the `<proposed_terms>` block. Built
+   * upstream by `buildProposedHints`. Pass an empty string (or omit)
+   * to drop the section entirely. The `<proposed_terms unvetted="true">`
+   * wrapper is added by this builder so both the simulator and the
+   * pipeline render the same way.
    */
   proposed_hints_block?: string;
+  /**
+   * Per-project translator-prompt toggles. Defaults to "everything
+   * on" via {@link resolvePromptOptions} — pass a partial / null
+   * value to override.
+   */
+  prompt_options?: PromptOptions | null;
 }
 
 export function buildTranslatorMessages(
@@ -627,26 +728,20 @@ export function buildTranslatorMessages(
   if (!input.source_text) {
     throw new Error("source_text must not be empty");
   }
-  const style_guide_block = input.style_guide?.trim()
-    ? `Style guide:\n${input.style_guide.trim()}\n\n`
+  const opts = resolvePromptOptions(input.prompt_options ?? null);
+
+  const language_notes_block = opts.include_language_notes
+    ? formatLanguagePairNotes(input.source_lang, input.target_lang)
     : "";
-  const chapter_notes_block = input.chapter_notes?.trim()
-    ? `Chapter notes (context for this whole chapter — do not translate them):\n${input.chapter_notes.trim()}\n\n`
+  const style_guide_block = opts.include_style_guide
+    ? formatStyleGuideBlock(input.style_guide)
+    : "";
+  const book_summary_block = opts.include_book_summary
+    ? formatBookSummaryBlock(input.book_summary)
     : "";
   const glossary_block = formatGlossaryBlock(input.glossary ?? []);
-  const target_only_block = formatTargetOnlyBlock(
-    input.target_only_glossary ?? [],
-  );
-  const language_notes_block = formatLanguagePairNotes(
-    input.source_lang,
-    input.target_lang,
-  );
-  const context_block = formatContextBlock(input.context ?? []);
-  // Proposed-hints block is pre-formatted by `buildProposedHints`;
-  // we just append a trailing blank line so the prompt sections
-  // separate cleanly. An empty input collapses the entire section.
-  const proposed_hints_block = input.proposed_hints_block?.trim()
-    ? `${input.proposed_hints_block.trim()}\n\n`
+  const target_only_block = opts.include_target_only
+    ? formatTargetOnlyBlock(input.target_only_glossary ?? [])
     : "";
 
   const system_content = SYSTEM_PROMPT_TEMPLATE.replace(
@@ -654,18 +749,58 @@ export function buildTranslatorMessages(
     formatLanguageLabel(input.source_lang),
   )
     .replace("{target_lang}", formatLanguageLabel(input.target_lang))
-    .replace("{style_guide_block}", style_guide_block)
-    .replace("{chapter_notes_block}", chapter_notes_block)
-    .replace("{glossary_block}", glossary_block)
-    .replace("{target_only_block}", target_only_block)
     .replace("{language_notes_block}", language_notes_block)
-    .replace("{proposed_hints_block}", proposed_hints_block)
-    .replace("{context_block}", context_block);
+    .replace("{style_guide_block}", style_guide_block)
+    .replace("{book_summary_block}", book_summary_block)
+    .replace("{glossary_block}", glossary_block)
+    .replace("{target_only_block}", target_only_block);
+
+  const user_content = buildTranslatorUserContent({
+    source_text: input.source_text,
+    chapter_notes: opts.include_chapter_notes ? input.chapter_notes : null,
+    proposed_hints_block: opts.include_proposed_hints
+      ? input.proposed_hints_block
+      : "",
+    context: opts.include_recent_context ? input.context : [],
+  });
 
   return [
     { role: "system", content: system_content },
-    { role: "user", content: input.source_text },
+    { role: "user", content: user_content },
   ];
+}
+
+interface TranslatorUserContentInput {
+  source_text: string;
+  chapter_notes?: string | null;
+  proposed_hints_block?: string;
+  context?: readonly ContextSegment[];
+}
+
+/**
+ * Render the per-segment XML user message.
+ *
+ * Each block is omitted when its inputs collapse to empty so the
+ * cache key stays minimal for chapters without notes / context. The
+ * `<source>` block is always last so the LLM's attention lands on
+ * "what to translate" right before it starts decoding.
+ */
+function buildTranslatorUserContent(
+  input: TranslatorUserContentInput,
+): string {
+  const chapter_notes_block = formatChapterNotesBlock(input.chapter_notes);
+  const proposed_hints_block = formatProposedHintsUserBlock(
+    input.proposed_hints_block,
+  );
+  const context_block = formatRecentContextBlock(input.context ?? []);
+  const source_block = `<source>${input.source_text}</source>`;
+
+  const parts: string[] = [];
+  if (chapter_notes_block) parts.push(chapter_notes_block.trimEnd());
+  if (proposed_hints_block) parts.push(proposed_hints_block.trimEnd());
+  if (context_block) parts.push(context_block.trimEnd());
+  parts.push(source_block);
+  return parts.join("\n\n");
 }
 
 export interface BuildGroupTranslatorMessagesInput {
@@ -673,8 +808,19 @@ export interface BuildGroupTranslatorMessagesInput {
   target_lang: string;
   source_items: ReadonlyArray<readonly [number, string]>;
   style_guide?: string | null;
+  /**
+   * Project-level book summary, mirrored from the single-segment
+   * builder so a `<book_summary>` block lands in the cacheable
+   * system prefix. Group runs only ever fire on TOC / list shaped
+   * spine entries, so the summary rarely meaningfully helps — but
+   * keeping the system prefix shape stable across both flows keeps
+   * the prompt simulator and audit trail symmetric.
+   */
+  book_summary?: string | null;
   glossary?: readonly GlossaryConstraint[];
   target_only_glossary?: readonly TargetOnlyConstraint[];
+  /** Project-level prompt-block toggles. */
+  prompt_options?: PromptOptions | null;
 }
 
 export function buildGroupTranslatorMessages(
@@ -694,34 +840,40 @@ export function buildGroupTranslatorMessages(
     seen.add(item_id);
   }
 
-  const style_guide_block = input.style_guide?.trim()
-    ? `Style guide:\n${input.style_guide.trim()}\n\n`
+  const opts = resolvePromptOptions(input.prompt_options ?? null);
+
+  const language_notes_block = opts.include_language_notes
+    ? formatLanguagePairNotes(input.source_lang, input.target_lang)
+    : "";
+  const style_guide_block = opts.include_style_guide
+    ? formatStyleGuideBlock(input.style_guide)
+    : "";
+  const book_summary_block = opts.include_book_summary
+    ? formatBookSummaryBlock(input.book_summary)
     : "";
   const glossary_block = formatGlossaryBlock(input.glossary ?? []);
-  const target_only_block = formatTargetOnlyBlock(
-    input.target_only_glossary ?? [],
-  );
-  const language_notes_block = formatLanguagePairNotes(
-    input.source_lang,
-    input.target_lang,
-  );
+  const target_only_block = opts.include_target_only
+    ? formatTargetOnlyBlock(input.target_only_glossary ?? [])
+    : "";
 
   const system_content = GROUP_SYSTEM_PROMPT_TEMPLATE.replace(
     "{source_lang}",
     formatLanguageLabel(input.source_lang),
   )
     .replace("{target_lang}", formatLanguageLabel(input.target_lang))
+    .replace("{language_notes_block}", language_notes_block)
     .replace("{style_guide_block}", style_guide_block)
+    .replace("{book_summary_block}", book_summary_block)
     .replace("{glossary_block}", glossary_block)
-    .replace("{target_only_block}", target_only_block)
-    .replace("{language_notes_block}", language_notes_block);
+    .replace("{target_only_block}", target_only_block);
 
   const user_payload = {
     items: input.source_items.map(([id, source]) => ({ id, source })),
   };
+  const user_content = `<items>\n${JSON.stringify(user_payload)}\n</items>`;
   return [
     { role: "system", content: system_content },
-    { role: "user", content: JSON.stringify(user_payload) },
+    { role: "user", content: user_content },
   ];
 }
 

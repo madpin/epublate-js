@@ -11,6 +11,12 @@
  *   spend their visible-channel budget on reasoning tokens.
  * - Older self-hosted llama.cpp / Ollama builds return a 400 with
  *   `response_format` mentioned somewhere in the body.
+ * - Some Ollama builds (notably the `gemma4:*` family at the time of
+ *   writing) crash the underlying llama.cpp runner when JSON-mode
+ *   grammar-constrained sampling is enabled, surfacing as a 5xx
+ *   `"llama runner process no longer running"` error. The runner is
+ *   re-spawned for the next request, so retrying without
+ *   `response_format` succeeds.
  *
  * Hard-failing breaks the helper-LLM extractor on those endpoints. We
  * retry the call once *without* `response_format` so the prompt's
@@ -32,6 +38,10 @@ const JSON_MODE_ERROR_PATTERNS: readonly string[] = [
   "json mode",
   "structured output",
   "response format",
+  // Ollama runner crash from json-grammar sampling on some model
+  // families (e.g. `gemma4:26b`). The runner is re-spawned before the
+  // next request, so dropping `response_format` lets us recover.
+  "llama runner process",
 ];
 
 export async function chatWithJsonFallback(

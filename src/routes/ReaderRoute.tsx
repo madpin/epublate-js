@@ -37,6 +37,7 @@ import { useLiveQuery } from "dexie-react-hooks";
 import {
   ArrowLeft,
   Check,
+  CircuitBoard,
   Layers,
   Pencil,
   Play,
@@ -45,6 +46,7 @@ import {
 import { toast } from "sonner";
 
 import { BatchModal } from "@/components/forms/BatchModal";
+import { PromptPreviewPanel } from "@/components/reader/PromptPreviewPanel";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -64,6 +66,7 @@ import {
   countRunningByChapter,
 } from "@/db/repo/segments";
 import { listChapters, updateChapterNotes } from "@/db/repo/chapters";
+import { useRunChapterSummary } from "@/hooks/useRunChapterSummary";
 import { listGlossaryEntries } from "@/db/repo/glossary";
 import { resolveProjectGlossaryWithLore } from "@/lore/attach";
 import {
@@ -540,6 +543,7 @@ export function ReaderRoute(): React.JSX.Element {
   const removeTranslating = useTranslatingStore((s) => s.remove);
   const [edit_segment_id, setEditSegmentId] = React.useState<string | null>(null);
   const [batch_open, setBatchOpen] = React.useState(false);
+  const [prompt_panel_open, setPromptPanelOpen] = React.useState(false);
 
   // Build the LLM provider lazily — `buildProvider` reads the live
   // library row, which already contains everything Settings persists.
@@ -758,6 +762,13 @@ export function ReaderRoute(): React.JSX.Element {
         // pre-filled.
         ev.preventDefault();
         if (current_chapter_id) setBatchOpen(true);
+      } else if (ev.key === "P" && ev.shiftKey) {
+        // Shift+P = toggle the Prompt preview panel. The panel
+        // re-runs `previewSegmentPrompt` against the focused
+        // segment so the rendered prompt is byte-equivalent to
+        // what `translateSegment` would post.
+        ev.preventDefault();
+        setPromptPanelOpen((v) => !v);
       } else if (ev.key === "t" && !ev.shiftKey && seg) {
         ev.preventDefault();
         void runTranslation(seg);
@@ -1086,6 +1097,21 @@ export function ReaderRoute(): React.JSX.Element {
           <Button
             size="sm"
             variant="outline"
+            onClick={() => setPromptPanelOpen(true)}
+            disabled={!active_segment_row}
+            title={
+              active_segment_row
+                ? "Preview the exact translator prompt for the focused segment (Shift+P)"
+                : "Focus a segment to preview its prompt"
+            }
+            className="gap-1.5"
+          >
+            <CircuitBoard className="size-3.5" />
+            Preview prompt
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
             onClick={() => setBatchOpen(true)}
             disabled={!current_chapter_id || chapter_pending_count === 0}
             title={
@@ -1104,8 +1130,8 @@ export function ReaderRoute(): React.JSX.Element {
             ) : null}
           </Button>
           <div className="text-[11px] text-muted-foreground">
-            ↑/↓ navigate · t translate · ⇧T chapter · r retry · a accept · e
-            edit
+            ↑/↓ navigate · t translate · ⇧T chapter · ⇧P preview · r retry · a
+            accept · e edit
           </div>
         </div>
       </header>
@@ -1223,6 +1249,19 @@ export function ReaderRoute(): React.JSX.Element {
         pending_count={chapter_pending_count}
         open={batch_open}
         onOpenChange={setBatchOpen}
+      />
+
+      <PromptPreviewPanel
+        open={prompt_panel_open}
+        onOpenChange={setPromptPanelOpen}
+        project_id={projectId}
+        source_lang={project.source_lang}
+        target_lang={project.target_lang}
+        segment={active_segment_row ? rowToSegment(active_segment_row) : null}
+        chapter_title={current_chapter_label}
+        model={provider_handle?.model ?? "(unset)"}
+        prompt_options={detail.prompt_options}
+        embedding_provider={embedding_provider}
       />
     </div>
   );
@@ -1874,6 +1913,8 @@ function ChapterNotesButton({
   const [open, setOpen] = React.useState(false);
   const [draft, setDraft] = React.useState("");
   const [saving, setSaving] = React.useState(false);
+  const { start: runChapterSummary, running: generating } =
+    useRunChapterSummary();
 
   React.useEffect(() => {
     if (!open) return;
@@ -1901,6 +1942,18 @@ function ChapterNotesButton({
       toast.error(`Could not save: ${msg}`);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const onGenerate = async (): Promise<void> => {
+    const results = await runChapterSummary(project_id, { chapter_id });
+    const result = results?.[0];
+    if (result?.summary) {
+      // Re-pull the row so the textarea reflects the freshly-written
+      // notes without forcing the curator to close + re-open the
+      // dialog.
+      const row = await openProjectDb(project_id).chapters.get(chapter_id);
+      setDraft(row?.notes ?? result.summary);
     }
   };
 
@@ -1942,23 +1995,40 @@ function ChapterNotesButton({
             }
             className="text-sm"
             autoFocus
+            disabled={saving || generating}
           />
-          <DialogFooter>
+          <DialogFooter className="gap-2 sm:justify-between">
             <Button
-              variant="outline"
+              variant="secondary"
               type="button"
-              onClick={() => setOpen(false)}
-              disabled={saving}
+              onClick={() => void onGenerate()}
+              disabled={saving || generating}
+              className="gap-1.5"
+              title="Run the helper-LLM over this chapter's source segments and write a 50–120 word recap into the notes."
             >
-              Cancel
+              {generating
+                ? "Generating…"
+                : draft.trim()
+                  ? "Regenerate from chapter"
+                  : "Generate from chapter"}
             </Button>
-            <Button
-              type="button"
-              onClick={() => void onSave()}
-              disabled={saving}
-            >
-              {saving ? "Saving…" : "Save notes"}
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                type="button"
+                onClick={() => setOpen(false)}
+                disabled={saving || generating}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                onClick={() => void onSave()}
+                disabled={saving || generating}
+              >
+                {saving ? "Saving…" : "Save notes"}
+              </Button>
+            </div>
           </DialogFooter>
         </DialogContent>
       </Dialog>

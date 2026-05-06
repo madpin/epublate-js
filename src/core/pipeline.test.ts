@@ -330,20 +330,23 @@ describe("translateSegment", () => {
     });
 
     expect(chatSpy).toHaveBeenCalledTimes(1);
-    const sysMsg = chatSpy.mock.calls[0]![0]!.messages.find(
-      (m) => m.role === "system",
+    // Phase 1: per-segment volatile blocks (context, source) live in
+    // the user message now so OpenAI's prefix cache can reuse the
+    // system prefix across every segment in the chapter.
+    const userMsg = chatSpy.mock.calls[0]![0]!.messages.find(
+      (m) => m.role === "user",
     )!;
-    const sysContent =
-      typeof sysMsg.content === "string"
-        ? sysMsg.content
-        : JSON.stringify(sysMsg.content);
+    const userContent =
+      typeof userMsg.content === "string"
+        ? userMsg.content
+        : JSON.stringify(userMsg.content);
     // The context block must mention dialogue lines and not the
     // narrative prose between them.
-    expect(sysContent).toContain("Preceding segments");
-    expect(sysContent).toContain("Hello there");
-    expect(sysContent).toContain("how are you today");
-    expect(sysContent).not.toContain("warm and crowded");
-    expect(sysContent).not.toContain("smiled at him");
+    expect(userContent).toContain("<recent_context>");
+    expect(userContent).toContain("Hello there");
+    expect(userContent).toContain("how are you today");
+    expect(userContent).not.toContain("warm and crowded");
+    expect(userContent).not.toContain("smiled at him");
   });
 
   it("in dialogue context mode, narration segments translate with no context block", async () => {
@@ -409,19 +412,19 @@ describe("translateSegment", () => {
       options: { model: "mock-model" },
     });
 
-    const sysMsg = chatSpy.mock.calls[0]![0]!.messages.find(
-      (m) => m.role === "system",
+    const userMsg = chatSpy.mock.calls[0]![0]!.messages.find(
+      (m) => m.role === "user",
     )!;
-    const sysContent =
-      typeof sysMsg.content === "string"
-        ? sysMsg.content
-        : JSON.stringify(sysMsg.content);
+    const userContent =
+      typeof userMsg.content === "string"
+        ? userMsg.content
+        : JSON.stringify(userMsg.content);
 
     // Narration must not pick up the dialogue we already translated,
-    // and the "Preceding segments" header must not appear at all
+    // and the `<recent_context>` block must not appear at all
     // (cheap path: no context block emitted).
-    expect(sysContent).not.toContain("Hello there");
-    expect(sysContent).not.toContain("Preceding segments");
+    expect(userContent).not.toContain("Hello there");
+    expect(userContent).not.toContain("<recent_context>");
   });
 
   it("short-circuits trivially-empty segments without calling the LLM", async () => {
@@ -508,16 +511,19 @@ describe("translateSegment", () => {
       options: { model: "mock-model" },
     });
 
-    const sysMsg = spy.mock.calls[0]![0]!.messages.find(
-      (m) => m.role === "system",
+    // chapter_notes are now part of the per-segment user message
+    // (Phase 1: system stays cacheable; chapter notes change between
+    // chapters but stay stable across all segments in the chapter).
+    const userMsg = spy.mock.calls[0]![0]!.messages.find(
+      (m) => m.role === "user",
     )!;
-    const sysContent =
-      typeof sysMsg.content === "string"
-        ? sysMsg.content
-        : JSON.stringify(sysMsg.content);
-    expect(sysContent).toContain("Chapter notes");
-    expect(sysContent).toContain("unreliable");
-    expect(sysContent).toContain("'tu' for the protagonist");
+    const userContent =
+      typeof userMsg.content === "string"
+        ? userMsg.content
+        : JSON.stringify(userMsg.content);
+    expect(userContent).toContain("<chapter_notes>");
+    expect(userContent).toContain("unreliable");
+    expect(userContent).toContain("'tu' for the protagonist");
   });
 
   it("chapter notes change the cache key (notes edits invalidate cache)", async () => {
@@ -661,16 +667,18 @@ describe("translateSegment", () => {
       },
     });
 
-    const sys = spy.mock.calls[0]![0]!.messages.find(
-      (m) => m.role === "system",
+    // proposed_terms (unvetted hints) live in the per-segment user
+    // message (Phase 1) so the system prefix stays stable for caching.
+    const userMsg = spy.mock.calls[0]![0]!.messages.find(
+      (m) => m.role === "user",
     )!;
-    const sysContent =
-      typeof sys.content === "string"
-        ? sys.content
-        : JSON.stringify(sys.content);
-    expect(sysContent).toContain("Proposed terms (unvetted hints)");
-    expect(sysContent).toContain("first paragraph");
-    expect(sysContent).toContain("primeiro parágrafo");
+    const userContent =
+      typeof userMsg.content === "string"
+        ? userMsg.content
+        : JSON.stringify(userMsg.content);
+    expect(userContent).toContain('<proposed_terms unvetted="true">');
+    expect(userContent).toContain("first paragraph");
+    expect(userContent).toContain("primeiro parágrafo");
   });
 
   it("relevant context mode pulls cross-chapter top-K segments by cosine similarity", async () => {
@@ -828,21 +836,24 @@ describe("translateSegment", () => {
     });
 
     expect(chatSpy).toHaveBeenCalledTimes(1);
-    const sysMsg = chatSpy.mock.calls[0]![0]!.messages.find(
-      (m) => m.role === "system",
+    // recent_context (per-segment, volatile) lives in the user
+    // message — the relevant picker writes the same XML envelope
+    // as `previous` mode.
+    const userMsg = chatSpy.mock.calls[0]![0]!.messages.find(
+      (m) => m.role === "user",
     )!;
-    const sysContent =
-      typeof sysMsg.content === "string"
-        ? sysMsg.content
-        : JSON.stringify(sysMsg.content);
+    const userContent =
+      typeof userMsg.content === "string"
+        ? userMsg.content
+        : JSON.stringify(userMsg.content);
 
     // The relevant picker must have injected exactly one Ch1
     // candidate (we capped at K=1) and the prompt block header is
     // shared with `previous` mode.
-    expect(sysContent).toContain("Preceding segments");
+    expect(userContent).toContain("<recent_context>");
     // Whichever Ch1 candidate was picked, it must come from Ch1.
-    const wolves = sysContent.includes("wolves howled");
-    const judge = sysContent.includes("judge slammed");
+    const wolves = userContent.includes("wolves howled");
+    const judge = userContent.includes("judge slammed");
     expect(wolves || judge).toBe(true);
   });
 });

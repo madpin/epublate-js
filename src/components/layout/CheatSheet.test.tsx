@@ -49,6 +49,7 @@ describe("CheatSheet", () => {
       Previous segmentk / ↑
       Translate the focused segmentt
       Translate the whole chapterShift+T
+      Toggle the prompt preview panelShift+P
       Accept the focused translationa
       Edit the focused translatione
       Re-translate (bypass cache)r

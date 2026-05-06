@@ -259,6 +259,7 @@ The Reader saves the current chapter, focused segment, and source-pane scroll of
 | `k` / `↑` | Previous segment                                  |
 | `t`       | Translate the focused segment                     |
 | `Shift+T` | Translate the entire current chapter              |
+| `Shift+P` | Toggle the **Prompt preview** panel for the focused segment |
 | `r`       | Re-translate the focused segment, bypassing cache |
 | `a`       | Accept the focused translation                    |
 | `e`       | Edit the focused translation                      |
@@ -376,6 +377,58 @@ Save with the header button or `Ctrl/⌘+S`. Every save writes a `project.update
 
 ---
 
+## Configurable prompts, summaries, and the Prompt simulator
+
+Project Settings exposes four adjacent cards that together let curators look inside — and tune — the exact prompt the translator LLM sees.
+
+### Prompt options
+
+![Prompt options card with toggle chips for each prompt block, grouped by system prefix and user tail](screenshots/09c-prompt-options.png)
+
+Each translation prompt is built from a fixed set of blocks. Toggle them off to make the prompt smaller (and cheaper); toggle them on to give the translator more context. The system-prefix blocks (language notes, style guide, book summary, target-only terms) are part of the cacheable prefix — flipping one invalidates the cache for this project once and then reuses the new prefix for every subsequent segment. The user-tail blocks (chapter notes, proposed-term hints, recent context) only invalidate the segments they actually touch.
+
+### Book summary
+
+![Book summary card with the empty state and the Generate-from-book CTA](screenshots/09d-book-summary.png)
+
+A 200–400 word premise of the book that lands in the cacheable system prefix. Two ways to populate it:
+
+- **Generate from book.** Calls the helper LLM over the book's first ~30 segments and pastes the result into the textarea. Editable afterwards.
+- **Hand-write.** Type whatever you want; click **Save** to persist.
+
+The textarea shows a live token count so curators can keep the recurring prefix size honest. **Clear** drops the summary entirely (the prompt block disappears even when the *Book summary* toggle in **Prompt options** is on). Every helper-LLM run leaves an `intake_run` row in **Intake runs**.
+
+### Chapter summaries
+
+![Chapter summaries card listing per-chapter rows with Generate / Regenerate / Clear actions and bulk controls](screenshots/09e-chapter-summaries.png)
+
+A 50–120 word recap per chapter. Stored alongside the chapter notes (same column — typing into the per-chapter textarea is equivalent to editing the **Notes** dialog in the Reader). Bulk actions:
+
+- **Generate missing** — runs the helper LLM only over chapters whose recap is currently empty.
+- **Regenerate all** — wipes every recap and starts fresh. Confirmation dialog because this is destructive for hand-edits.
+
+You can also trigger a per-chapter generate from inside the Reader's **Notes** dialog — the helper LLM writes back into the same field, the audit ledger gets the same `intake_run`, and the Reader's chapter-notes pip lights up immediately.
+
+### Prompt simulator
+
+![Prompt simulator card showing the byte-equivalent translator prompt for a representative segment, with what-if toggle bar and the system / user / wire-payload tabs](screenshots/09f-prompt-simulator.png)
+
+The simulator picks the first non-empty segment of the project as a pivot and shows the **exact** translator prompt that would be posted for it. It re-runs the same code paths as the live pipeline (`previewSegmentPrompt`), so the wire payload tab is byte-equivalent to what `translateSegment` would send.
+
+Three tabs:
+
+- **System** — the cacheable prefix (XML-tagged blocks).
+- **User** — the per-segment tail (chapter notes, proposed hints, context, source).
+- **Wire payload** — the JSON body that hits the LLM endpoint.
+
+The **what-if** chips above the tabs override the persisted **Prompt options** for preview only — flip a toggle to see how a block change moves the meters. Resetting reverts to the persisted state. **Nothing is saved or sent.**
+
+The same panel is one keystroke away in the Reader: focus a segment, press **`Shift+P`** (or click **Preview prompt** in the header).
+
+![Reader with the Prompt preview panel slid in from the right, showing the focused segment's prompt and cache-status badge](screenshots/05d-reader-prompt-preview.png)
+
+---
+
 ## Lore Books
 
 ![Lore Books library — a table of three Lore Books with their entry counts, source / target languages, and "Open" / "Detach all" actions](screenshots/10-lore-books.png)
@@ -476,6 +529,7 @@ Press `?` or `F1` from any screen to open the cheat sheet:
 |             | `k` / `↑`   | Previous segment                                |
 |             | `t`         | Translate focused segment                       |
 |             | `Shift+T`   | Translate the whole chapter                     |
+|             | `Shift+P`   | Toggle the **Prompt preview** panel             |
 |             | `a`         | Accept focused translation                      |
 |             | `e`         | Edit focused translation                        |
 |             | `r`         | Re-translate focused segment, bypass cache      |

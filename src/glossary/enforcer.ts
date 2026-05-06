@@ -198,15 +198,20 @@ const DEFAULT_HINT_TOP_K = 8;
 const DEFAULT_HINT_MIN_SIMILARITY = 0.72;
 
 /**
- * Build the "Proposed terms (unvetted hints)" block for the
- * translator system prompt.
+ * Build the body of the `<proposed_terms>` block for the translator
+ * user message.
+ *
+ * Returns the bare entry lines (no heading, no advisory prose). The
+ * surrounding XML wrapper (`<proposed_terms unvetted="true">…
+ * </proposed_terms>`) and the "apply only if it fits" guidance live
+ * in the system prompt's hard rule 10, so the body stays minimal —
+ * which keeps the user-message portion of the cache key tight.
  *
  * The block lists at most `top_k` proposed entries, sorted by
  * descending similarity, only including those whose vector clears
  * `min_similarity`. Entries are formatted identically to the
  * confirmed glossary block so the LLM doesn't have to relearn the
- * shape, but the heading and the new rule (added in
- * `prompts/translator.ts`) make it clear they're advisory.
+ * shape.
  *
  * Determinism: ties on similarity break on `entry.id` so identical
  * inputs always produce identical output → cache key stays stable
@@ -251,11 +256,6 @@ export function buildProposedHints(
   });
 
   const lines: string[] = [];
-  lines.push("### Proposed terms (unvetted hints)");
-  lines.push(
-    "Apply only if the source uses the term in the same sense; otherwise translate idiomatically.",
-  );
-  lines.push("");
   for (const { ent } of display) {
     const src = ent.entry.source_term ?? "";
     const tgt = ent.entry.target_term;
@@ -268,7 +268,6 @@ export function buildProposedHints(
       : "";
     lines.push(`- ${src} → ${tgt}${type_part}${gender_part}${notes_part}`);
   }
-  lines.push("");
   return {
     block: lines.join("\n"),
     used_ids: picked.map((p) => p.ent.entry.id),

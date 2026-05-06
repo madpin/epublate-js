@@ -6,11 +6,18 @@ import {
   deleteProject,
   getOriginalEpubBytes,
   loadProject,
+  updateProjectSettings,
 } from "./projects";
 import { findLatestStyleSuggestion, recordIntakeRun } from "./intake";
 import { openProjectDb } from "../dexie";
 import { libraryDb } from "../library";
-import { IntakeRunKind, IntakeRunStatus } from "../schema";
+import {
+  DEFAULT_PROMPT_OPTIONS,
+  IntakeRunKind,
+  IntakeRunStatus,
+  type PromptOptions,
+} from "../schema";
+import { resolvePromptOptions } from "@/core/prompt_options";
 
 describe("createProject", () => {
   it("writes both the per-project and library rows + stores the source blob", async () => {
@@ -165,5 +172,79 @@ describe("applyStyleProfile + findLatestStyleSuggestion", () => {
     project_id = project.id;
     const latest = await findLatestStyleSuggestion(project.id);
     expect(latest).toBeNull();
+  });
+});
+
+describe("ProjectRow prompt-config fields", () => {
+  let project_id: string | null = null;
+  afterEach(async () => {
+    if (project_id) {
+      await deleteProject(project_id);
+      project_id = null;
+    }
+  });
+
+  it("legacy rows omit book_summary + prompt_options and resolve to defaults", async () => {
+    const project = await createProject({
+      name: "Legacy",
+      source_lang: "ja",
+      target_lang: "en",
+      source_filename: "sample.epub",
+      source_bytes: new Uint8Array([1]).buffer,
+    });
+    project_id = project.id;
+
+    const reread = await loadProject(project.id);
+    expect(reread.book_summary).toBeUndefined();
+    expect(reread.prompt_options).toBeUndefined();
+
+    expect(resolvePromptOptions(reread.prompt_options)).toEqual(
+      DEFAULT_PROMPT_OPTIONS,
+    );
+  });
+
+  it("round-trips book_summary and prompt_options through Dexie", async () => {
+    const project = await createProject({
+      name: "Settings",
+      source_lang: "ja",
+      target_lang: "en",
+      source_filename: "sample.epub",
+      source_bytes: new Uint8Array([1]).buffer,
+    });
+    project_id = project.id;
+
+    const opts: PromptOptions = {
+      ...DEFAULT_PROMPT_OPTIONS,
+      include_proposed_hints: false,
+      include_recent_context: false,
+    };
+    await updateProjectSettings(project.id, {
+      book_summary: "  A coming-of-age novella set in postwar Tokyo. ",
+      prompt_options: opts,
+    });
+
+    const reread = await loadProject(project.id);
+    expect(reread.book_summary).toBe(
+      "A coming-of-age novella set in postwar Tokyo.",
+    );
+    expect(reread.prompt_options).toEqual(opts);
+
+    await updateProjectSettings(project.id, {
+      book_summary: "   ",
+      prompt_options: null,
+    });
+
+    const cleared = await loadProject(project.id);
+    expect(cleared.book_summary).toBeNull();
+    expect(cleared.prompt_options).toBeNull();
+    expect(resolvePromptOptions(cleared.prompt_options)).toEqual(
+      DEFAULT_PROMPT_OPTIONS,
+    );
+
+    const db = openProjectDb(project.id);
+    const event_kinds = (
+      await db.events.where("project_id").equals(project.id).toArray()
+    ).map((e) => e.kind);
+    expect(event_kinds).toContain("project.updated");
   });
 });

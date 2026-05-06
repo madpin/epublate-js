@@ -80,6 +80,69 @@ describe("OpenAICompatProvider header hardening", () => {
     expect(hint).toContain("CORS");
   });
 
+  it("calls out Private Network Access when an HTTPS page targets http://localhost", () => {
+    // Force the diagnostic into "page is HTTPS" mode without pulling
+    // in JSDOM's full origin tracking.
+    const original = globalThis.window;
+    Object.defineProperty(globalThis, "window", {
+      value: {
+        location: { origin: "https://epublate.example.app" },
+      },
+      configurable: true,
+    });
+    try {
+      const err = new TypeError("Failed to fetch");
+      const hint = explainFetchFailure(
+        err,
+        "http://localhost:11434/v1/chat/completions",
+      );
+      expect(hint).toMatch(/Private Network Access|mixed-content/);
+      expect(hint).toContain("https://epublate.example.app");
+      expect(hint).toContain("tailscale serve");
+      // Should keep the practical curl probe intact.
+      expect(hint).toContain("/v1/models");
+    } finally {
+      if (original) {
+        Object.defineProperty(globalThis, "window", {
+          value: original,
+          configurable: true,
+        });
+      } else {
+        // @ts-expect-error – we delete the temporary stub when the
+        // suite ran without a real window to begin with.
+        delete globalThis.window;
+      }
+    }
+  });
+
+  it("offers an Ollama-specific hint when the page is loopback-on-loopback", () => {
+    const original = globalThis.window;
+    Object.defineProperty(globalThis, "window", {
+      value: { location: { origin: "http://localhost:5173" } },
+      configurable: true,
+    });
+    try {
+      const err = new TypeError("Failed to fetch");
+      const hint = explainFetchFailure(
+        err,
+        "http://localhost:11434/v1/chat/completions",
+      );
+      expect(hint).toContain("OLLAMA_ORIGINS");
+      expect(hint).toContain("launchctl");
+      expect(hint).toContain("Access-Control-Allow-Origin");
+    } finally {
+      if (original) {
+        Object.defineProperty(globalThis, "window", {
+          value: original,
+          configurable: true,
+        });
+      } else {
+        // @ts-expect-error – temporary stub cleanup.
+        delete globalThis.window;
+      }
+    }
+  });
+
   it("forwards sanitized ollama options as a top-level `options` body field", async () => {
     let captured_body: string | undefined;
     const fetchImpl: typeof fetch = vi.fn(

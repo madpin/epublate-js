@@ -23,7 +23,12 @@ export function useOfflineReady(): boolean {
 
   React.useEffect(() => {
     if (typeof window === "undefined") return;
-    const onReady = (): void => setReady(true);
+    // Re-read localStorage rather than blindly setting `true` — the
+    // event may have been fired while the persisted flag was clear
+    // (e.g. another tab cleared it just before our listener attached,
+    // or a test harness dispatched a stray event). The flag in
+    // localStorage is the source of truth.
+    const onReady = (): void => setReady(readOfflineReady());
     const onStorage = (ev: StorageEvent): void => {
       if (ev.key === null || ev.key === "epublate-offline-ready") {
         setReady(readOfflineReady());

@@ -52,6 +52,7 @@ import {
 } from "@/db/schema";
 import { readProjectStats } from "@/core/stats";
 import { useBatchStore } from "@/state/batch";
+import { useRunBookSummary } from "@/hooks/useRunBookSummary";
 import {
   detachLoreBook,
   listAttachedLore,
@@ -302,6 +303,10 @@ export function DashboardRoute(): React.JSX.Element {
                 Edit style
               </Button>
             </div>
+            <BookSummaryStatusRow
+              project_id={projectId}
+              book_summary={detail.book_summary ?? null}
+            />
             {suggestion &&
             suggestion.suggested_style_profile &&
             suggestion.suggested_style_profile !==
@@ -559,6 +564,70 @@ function Stat({ label, value }: { label: string; value: string }): React.JSX.Ele
     <div className="flex items-baseline justify-between gap-3">
       <span className="text-muted-foreground">{label}</span>
       <span className="font-mono text-sm">{value}</span>
+    </div>
+  );
+}
+
+/**
+ * Compact "do you have a book summary yet?" status + on-demand
+ * regenerate. Mirrors the StyleProfile row above so curators see both
+ * project-wide context inputs side-by-side.
+ *
+ * The button uses the same `useRunBookSummary` hook the Settings card
+ * does, so an `intake_run` row + Sonner toast land regardless of where
+ * the curator triggered the run from. The deep link to{" "}
+ * `/project/<id>/settings#book-summary` is intentional — it lands the
+ * curator on the Settings card where they can edit / clear the
+ * summary by hand without leaving the Dashboard for a bigger detour.
+ */
+function BookSummaryStatusRow({
+  project_id,
+  book_summary,
+}: {
+  project_id: string;
+  book_summary: string | null;
+}): React.JSX.Element {
+  const { start, running } = useRunBookSummary();
+  const has_summary = Boolean(book_summary?.trim());
+  const word_count = has_summary
+    ? (book_summary as string).trim().split(/\s+/).length
+    : 0;
+  return (
+    <div className="flex items-center justify-between gap-2 border-t pt-3">
+      <div className="min-w-0">
+        <div className="text-xs uppercase tracking-wide text-muted-foreground">
+          Book summary
+        </div>
+        <div className="truncate text-sm font-medium">
+          {has_summary
+            ? `${word_count} word${word_count === 1 ? "" : "s"}`
+            : "Not set"}
+        </div>
+      </div>
+      <div className="flex items-center gap-1.5">
+        <Button asChild size="sm" variant="ghost">
+          <Link to={`/project/${project_id}/settings#book-summary`}>
+            Edit
+          </Link>
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={running}
+          onClick={() => void start(project_id)}
+          title={
+            has_summary
+              ? "Regenerate the book summary from the source ePub via the helper LLM."
+              : "Generate a 200–400 word book summary from the source ePub via the helper LLM."
+          }
+        >
+          {running
+            ? "Generating…"
+            : has_summary
+              ? "Regenerate"
+              : "Generate"}
+        </Button>
+      </div>
     </div>
   );
 }

@@ -291,6 +291,38 @@ async function captureReader(page) {
       await page.waitForTimeout(300);
     }
   }
+
+  // 05d — Prompt preview panel (P4). The Reader exposes a "Preview
+  // prompt" button next to "Translate chapter" plus a Shift+P
+  // hotkey. We use the keyboard hotkey because the button is
+  // disabled until a segment is focused — the auto-focus does pick
+  // one once segments mount, but the click race is fiddly. The
+  // hotkey path also documents the keyboard contract directly.
+  // Wait for the panel header (Radix renders it as an h2, but it
+  // also stacks badges so we match by partial text).
+  try {
+    // Make sure the Reader has focus so Shift+P doesn't get
+    // swallowed by an out-of-frame element. Click on the source
+    // pane background; the keydown handler ignores inputs/textareas
+    // so this is safe.
+    await page
+      .locator('[data-segment-id]')
+      .first()
+      .click({ position: { x: 4, y: 4 } })
+      .catch(() => {});
+    await page.waitForTimeout(200);
+    await page.keyboard.press("Shift+P");
+    await page
+      .getByText("Prompt preview", { exact: false })
+      .first()
+      .waitFor({ timeout: 8000 });
+    await page.waitForTimeout(1200);
+    await snap(page, "05d-reader-prompt-preview");
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.waitForTimeout(300);
+  } catch (err) {
+    log("  could not capture prompt-preview panel:", err.message);
+  }
 }
 
 async function captureGlossary(page) {
@@ -342,6 +374,34 @@ async function captureProjectSettings(page) {
     }
   } else {
     log("  context mode dropdown not found, skipping 09b");
+  }
+
+  // 09c–f — Phase 3 cards. Each renders a `<Card id="…">` so we can
+  // target them by id rather than by accessible heading name (the
+  // shadcn `CardTitle` is a `<div>`, not an `<h3>`, so `getByRole
+  // ("heading")` doesn't see it).
+  for (const [card_id, snap_name, label] of [
+    ["prompt-options", "09c-prompt-options", "Prompt options"],
+    ["book-summary", "09d-book-summary", "Book summary"],
+    ["chapter-summaries", "09e-chapter-summaries", "Chapter summaries"],
+    ["prompt-simulator", "09f-prompt-simulator", "Prompt simulator"],
+  ]) {
+    log(`== Project settings → ${label} ==`);
+    const card = page.locator(`#${card_id}`).first();
+    if ((await card.count()) > 0) {
+      try {
+        await card.scrollIntoViewIfNeeded();
+        // The simulator rebuilds the preview asynchronously — give it
+        // a beat to render the system / user token meters before we
+        // snap.
+        await page.waitForTimeout(card_id === "prompt-simulator" ? 1000 : 300);
+        await snap(page, snap_name);
+      } catch (err) {
+        log(`  could not scroll to ${card_id} card:`, err.message);
+      }
+    } else {
+      log(`  ${card_id} card not found, skipping ${snap_name}`);
+    }
   }
 }
 

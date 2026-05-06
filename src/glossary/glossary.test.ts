@@ -278,7 +278,11 @@ describe("enforcer.buildProposedHints", () => {
       min_similarity: 0.7,
     });
     expect(out.used_ids.sort()).toEqual(["high", "mid"]);
-    expect(out.block).toContain("Proposed terms (unvetted hints)");
+    // Phase 1: `buildProposedHints` returns body lines only — the
+    // surrounding `<proposed_terms unvetted="true">` wrapper is added
+    // by `buildTranslatorMessages` so the user-message portion of the
+    // cache key stays minimal.
+    expect(out.block).not.toContain("Proposed terms (unvetted hints)");
     expect(out.block).toContain("wolf → lobo");
     expect(out.block).toContain("moon → lua");
     expect(out.block).not.toContain("fog");

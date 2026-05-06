@@ -36,10 +36,15 @@ The capture runs at viewport `1024 × 640` against the default `epublate` theme.
 | 6  | `04-reader.png`                       | Reader              | Three-column Reader on Chapitre III with prose source + target panes.                             |
 | 7  | `05a-reader-translate-chapter.png`    | Reader header       | Reader with the "Translate chapter" button highlighted.                                           |
 | 8  | `05c-batch-modal-dashboard.png`       | Batch modal         | Translate-batch modal opened from the Dashboard, scope = whole project.                           |
+|    | `05d-reader-prompt-preview.png`       | Reader (Shift+P)    | Slide-in **Prompt preview** panel anchored to the focused segment with the System / User / Wire tabs. |
 | 9  | `06-glossary.png`                     | Glossary            | Glossary screen (mock mode populates few proposed entries; the layout is the focus).              |
 | 10 | `08-inbox.png`                        | Inbox               | Inbox empty-state structure: flagged segments / proposed entries / recent alerts cards.           |
 | 11 | `09-project-settings.png`             | Project Settings    | Identity, Style, Context-window, Budget, LLM-overrides cards.                                     |
 |    | `09b-relevant-context-mode.png`       | Project Settings    | Context-window card with the **Relevant** mode selected and the cosine-similarity sub-controls visible. |
+|    | `09c-prompt-options.png`              | Project Settings    | **Prompt options** card with the system-block + user-block checkbox grid that controls what each translation prompt carries. |
+|    | `09d-book-summary.png`                | Project Settings    | **Book summary** card — empty state with the "Generate from book" CTA, draft textarea, and live token count. |
+|    | `09e-chapter-summaries.png`           | Project Settings    | **Chapter summaries** card listing chapters with per-row generate / clear actions and the bulk "Generate missing" / "Regenerate all" controls. |
+|    | `09f-prompt-simulator.png`            | Project Settings    | **Prompt simulator** card showing the byte-equivalent translator prompt for the project's first non-empty segment, with what-if toggles and the system / user / wire-payload tabs. |
 | 12 | `10-lore-books.png`                   | Lore Books          | Empty Lore Books library with the New Lore Book + Import bundle CTAs.                             |
 | 13 | `12-settings-llm.png`                 | Settings → LLM      | LLM endpoint card with base URL + key + translator/helper model fields, plus Defaults and Pricing.|
 |    | `12c-ollama-options-card.png`         | Settings → Ollama options | Ollama-specific knobs (`num_ctx`, `num_predict`, sampling, Mirostat, **Disable thinking**) revealed via "Show anyway" because the mock base URL is OpenAI. Shows the four common-tier inputs + preset chips. |
