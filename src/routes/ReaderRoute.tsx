@@ -21,7 +21,10 @@
  * scroll the target pane to the same fractional offset on its matching
  * card. Per-card heights differ (source vs translated text aren't the
  * same length), so a pixel-only mirror would drift; segment anchoring
- * keeps the panes aligned at the segment level.
+ * keeps the panes aligned at the segment level. The two extremes (top
+ * and bottom) snap to absolute 0 / `scrollHeight - clientHeight`
+ * because the card-anchor loop can't bind to anything when the
+ * scrollTop sits in the leading or trailing padding of the pane.
  *
  * The Reader is read-mostly: writes go through the existing
  * `translateSegment` pipeline, and `useLiveQuery` re-reads the segment
@@ -780,6 +783,31 @@ export function ReaderRoute(): React.JSX.Element {
   ]);
 
   // Scroll source/target panes in lockstep at the segment level.
+  //
+  // The algorithm picks a "from" card that contains `scrollTop`, records
+  // the fractional offset within it, and applies the same fraction to
+  // the matching "to" card. Two edge cases need explicit handling that
+  // pure card-anchoring misses, both surfaced as "right pane stops a
+  // few pixels short when the left goes all the way up":
+  //
+  // 1. Top padding gap. The pane has `py-2`, so the first card's
+  //    `offsetTop` is ~8px. While `scrollTop` is in the [0, 8] range,
+  //    no card satisfies `top <= scrollTop < bottom` *and* the
+  //    "scrollTop >= bottom" branch never fires either, so the loop
+  //    leaves `anchor === null` and we bail without syncing. The
+  //    target pane stays at its last-anchored position rather than
+  //    following the source to the absolute top.
+  // 2. Trailing padding / bottom margin. Same problem mirrored at the
+  //    other end: at `scrollTop === scrollHeight - clientHeight` the
+  //    loop's last provisional anchor is `{frac: 1}` of the last card,
+  //    but the source has actually scrolled past that card's bottom by
+  //    a few pixels of padding, so the panes line up just shy of the
+  //    real bottom.
+  //
+  // Snap to the absolute extremes for both cases so top/bottom always
+  // mirror exactly, and fall back to `frac=0` on the first card if the
+  // loop trips into "above this card" before any anchor was set
+  // (covers the in-between sub-padding pixels too).
   const syncing_ref = React.useRef(false);
   const onPaneScroll = React.useCallback(
     (from: "source" | "target") => {
@@ -797,30 +825,55 @@ export function ReaderRoute(): React.JSX.Element {
       );
       if (!fromCards.length || !toCards.length) return;
       const scroll_top = fromPane.scrollTop;
-      let anchor: { id: string; frac: number } | null = null;
-      for (const card of fromCards) {
-        const top = card.offsetTop;
-        const bottom = top + card.offsetHeight;
-        if (top <= scroll_top && scroll_top < bottom) {
-          const id = card.dataset.segmentId ?? "";
-          const frac = card.offsetHeight
-            ? (scroll_top - top) / card.offsetHeight
-            : 0;
-          anchor = { id, frac };
-          break;
-        }
-        if (scroll_top >= bottom) {
-          const id = card.dataset.segmentId ?? "";
-          anchor = { id, frac: 1 };
-        }
-      }
-      if (!anchor) return;
-      const target_card = Array.from(toCards).find(
-        (c) => c.dataset.segmentId === anchor!.id,
+      const max_from = Math.max(
+        0,
+        fromPane.scrollHeight - fromPane.clientHeight,
       );
-      if (!target_card) return;
-      const next_y =
-        target_card.offsetTop + anchor.frac * target_card.offsetHeight;
+      const max_to = Math.max(0, toPane.scrollHeight - toPane.clientHeight);
+
+      let next_y: number;
+      if (scroll_top <= 0) {
+        next_y = 0;
+      } else if (scroll_top >= max_from - 0.5) {
+        next_y = max_to;
+      } else {
+        let anchor: { id: string; frac: number } | null = null;
+        for (const card of fromCards) {
+          const top = card.offsetTop;
+          const bottom = top + card.offsetHeight;
+          if (scroll_top < top) {
+            // Above this card. If we already provisional-anchored on
+            // the previous card (frac=1), keep it; otherwise we're
+            // above the first card, so anchor at its start so the
+            // target follows through the leading padding gap.
+            if (!anchor) {
+              anchor = { id: card.dataset.segmentId ?? "", frac: 0 };
+            }
+            break;
+          }
+          if (scroll_top < bottom) {
+            const id = card.dataset.segmentId ?? "";
+            const frac = card.offsetHeight
+              ? (scroll_top - top) / card.offsetHeight
+              : 0;
+            anchor = { id, frac };
+            break;
+          }
+          // scroll_top >= bottom — provisional anchor at end of this
+          // card; superseded if a later card actually contains
+          // `scroll_top`.
+          anchor = { id: card.dataset.segmentId ?? "", frac: 1 };
+        }
+        if (!anchor) return;
+        const target_card = Array.from(toCards).find(
+          (c) => c.dataset.segmentId === anchor!.id,
+        );
+        if (!target_card) return;
+        next_y =
+          target_card.offsetTop + anchor.frac * target_card.offsetHeight;
+      }
+
+      next_y = Math.max(0, Math.min(max_to, next_y));
       if (Math.abs(toPane.scrollTop - next_y) < 1) return;
       syncing_ref.current = true;
       toPane.scrollTop = next_y;
@@ -956,8 +1009,8 @@ export function ReaderRoute(): React.JSX.Element {
       : null);
 
   return (
-    <div className="flex h-full flex-col">
-      <header className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
+    <div className="flex h-full flex-col overflow-hidden">
+      <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
         <div className="flex min-w-0 items-center gap-2">
           <button
             type="button"
@@ -1057,7 +1110,7 @@ export function ReaderRoute(): React.JSX.Element {
         </div>
       </header>
 
-      <div className="grid min-h-0 flex-1 grid-cols-[14rem_minmax(0,1fr)_minmax(0,1fr)] gap-0 border-b">
+      <div className="grid min-h-0 flex-1 grid-cols-[14rem_minmax(0,1fr)_minmax(0,1fr)] gap-0">
         <ChapterList
           chapters={chapters}
           current_chapter_id={current_chapter_id}
@@ -1101,7 +1154,7 @@ export function ReaderRoute(): React.JSX.Element {
         />
       </div>
 
-      <footer className="flex flex-wrap items-center gap-2 px-4 py-3">
+      <footer className="flex shrink-0 flex-wrap items-center gap-2 border-t px-4 py-3">
         <Button
           variant="default"
           size="sm"

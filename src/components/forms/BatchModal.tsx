@@ -218,8 +218,8 @@ export function BatchModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl">
-        <DialogHeader>
+      <DialogContent className="flex max-h-[90vh] w-[95vw] max-w-3xl flex-col overflow-hidden">
+        <DialogHeader className="shrink-0">
           <DialogTitle>Translate batch</DialogTitle>
           <DialogDescription>
             Pick the chapters you want to translate, then start the batch.
@@ -253,7 +253,9 @@ export function BatchModal({
             ev.preventDefault();
             void onStart();
           }}
+          className="flex min-h-0 flex-1 flex-col"
         >
+        <div className="-mx-6 flex-1 overflow-y-auto px-6">
         {/* Chapter picker */}
         <div className="mb-4 rounded-md border">
           <div className="flex items-center gap-2 border-b bg-muted/30 px-3 py-1.5 text-xs">
@@ -408,7 +410,8 @@ export function BatchModal({
             </div>
           </div>
         </div>
-        <DialogFooter>
+        </div>
+        <DialogFooter className="shrink-0 border-t pt-4">
           <Button
             variant="outline"
             type="button"

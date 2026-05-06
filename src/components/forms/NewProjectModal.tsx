@@ -5,6 +5,10 @@ import { toast } from "sonner";
 import { Loader2, UploadCloud } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  ConfirmDiscardDialog,
+  useConfirmDiscard,
+} from "@/components/ui/confirm-discard-dialog";
 import { useFormShortcuts } from "@/hooks/useFormShortcuts";
 import {
   Dialog,
@@ -135,6 +139,17 @@ export function NewProjectModal({ open, onOpenChange }: Props): React.JSX.Elemen
   const formRef = React.useRef<HTMLFormElement | null>(null);
   useFormShortcuts(formRef, open);
 
+  // Selecting an .epub via drag-and-drop or the file picker is a
+  // time-consuming step (open Finder, navigate, drop). Once the
+  // curator has done it, an accidental click outside or stray Esc
+  // shouldn't silently throw it away — pop a confirm instead. The
+  // explicit Cancel and X close paths still bypass the confirm; this
+  // only intercepts implicit dismissals.
+  const has_progress = state.file !== null;
+  const discard_guard = useConfirmDiscard({
+    enabled: open && has_progress && !state.busy,
+  });
+
   const submit = async (): Promise<void> => {
     if (!state.file) {
       toast.error("Pick or drop an .epub file first.");
@@ -234,8 +249,9 @@ export function NewProjectModal({ open, onOpenChange }: Props): React.JSX.Elemen
   }, [open, reset]);
 
   return (
+    <>
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent {...discard_guard.contentProps}>
         <DialogHeader>
           <DialogTitle>New project</DialogTitle>
           <DialogDescription>
@@ -420,6 +436,32 @@ export function NewProjectModal({ open, onOpenChange }: Props): React.JSX.Elemen
         </form>
       </DialogContent>
     </Dialog>
+    <ConfirmDiscardDialog
+      open={discard_guard.confirm_open}
+      onOpenChange={discard_guard.setConfirmOpen}
+      title="Discard new project?"
+      description={
+        state.file ? (
+          <>
+            You&apos;ve picked{" "}
+            <span className="font-medium text-foreground">
+              {state.file.name}
+            </span>
+            . Closing now will lose the selection — you&apos;ll have to
+            pick the ePub again.
+          </>
+        ) : (
+          "You have unsaved changes. Closing now will lose them."
+        )
+      }
+      discard_label="Discard"
+      keep_label="Keep editing"
+      onConfirm={() => {
+        discard_guard.setConfirmOpen(false);
+        onOpenChange(false);
+      }}
+    />
+    </>
   );
 }
 
