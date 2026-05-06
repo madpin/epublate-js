@@ -80,7 +80,7 @@ describe("OpenAICompatProvider header hardening", () => {
     expect(hint).toContain("CORS");
   });
 
-  it("calls out Private Network Access when an HTTPS page targets http://localhost", () => {
+  it("calls out Local Network Access when an HTTPS page targets http://localhost", () => {
     // Force the diagnostic into "page is HTTPS" mode without pulling
     // in JSDOM's full origin tracking.
     const original = globalThis.window;
@@ -96,9 +96,14 @@ describe("OpenAICompatProvider header hardening", () => {
         err,
         "http://localhost:11434/v1/chat/completions",
       );
-      expect(hint).toMatch(/Private Network Access|mixed-content/);
+      // Chrome 142+ uses LNA (the spec name); we surface that
+      // explicitly so curators can search for it.
+      expect(hint).toMatch(/Local Network Access|LNA/);
+      // Tells the curator the legacy PNA flag is a no-op now.
+      expect(hint).toContain("BlockInsecurePrivateNetworkRequests");
       expect(hint).toContain("https://epublate.example.app");
       expect(hint).toContain("tailscale serve");
+      expect(hint).toContain("targetAddressSpace");
       // Should keep the practical curl probe intact.
       expect(hint).toContain("/v1/models");
     } finally {
@@ -141,6 +146,69 @@ describe("OpenAICompatProvider header hardening", () => {
         delete globalThis.window;
       }
     }
+  });
+
+  it("annotates loopback fetches with targetAddressSpace=loopback", async () => {
+    let captured_init: RequestInit | undefined;
+    const fetchImpl: typeof fetch = vi.fn(
+      async (_input: URL | RequestInfo, init?: RequestInit) => {
+        captured_init = init;
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "ok" } }],
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+            model: "llama3.2",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    );
+    const provider = new OpenAICompatProvider({
+      base_url: "http://localhost:11434/v1",
+      default_model: "llama3.2",
+      retry_policy: { max_retries: 0 },
+      fetchImpl,
+    });
+    await provider.chat({
+      model: "llama3.2",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    // Cast through `unknown`: `targetAddressSpace` is Chrome-specific
+    // and not in the standard RequestInit typings.
+    const lna = (captured_init as unknown as { targetAddressSpace?: string })
+      .targetAddressSpace;
+    expect(lna).toBe("loopback");
+  });
+
+  it("does not annotate cloud fetches with targetAddressSpace", async () => {
+    let captured_init: RequestInit | undefined;
+    const fetchImpl: typeof fetch = vi.fn(
+      async (_input: URL | RequestInfo, init?: RequestInit) => {
+        captured_init = init;
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "ok" } }],
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+            model: "gpt-5-mini",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    );
+    const provider = new OpenAICompatProvider({
+      base_url: "https://api.openai.com/v1",
+      api_key: "sk-test",
+      default_model: "gpt-5-mini",
+      retry_policy: { max_retries: 0 },
+      fetchImpl,
+    });
+    await provider.chat({
+      model: "gpt-5-mini",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const lna = (captured_init as unknown as { targetAddressSpace?: string })
+      .targetAddressSpace;
+    expect(lna).toBeUndefined();
   });
 
   it("forwards sanitized ollama options as a top-level `options` body field", async () => {

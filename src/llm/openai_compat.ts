@@ -38,6 +38,7 @@ import {
   buildOllamaBodyExtras,
   sanitizeOllamaOptions,
 } from "./ollama";
+import { targetAddressSpaceFor, withLnaInit } from "./private_network";
 
 const DEFAULT_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([
   408, 409, 500, 502, 503, 504,
@@ -175,7 +176,10 @@ export class OpenAICompatProvider implements LLMProvider {
     | null;
   private readonly ollama_options: OllamaOptions | null;
   private readonly fetchImpl: typeof fetch;
-  private readonly sleepImpl: (ms: number, signal?: AbortSignal) => Promise<void>;
+  private readonly sleepImpl: (
+    ms: number,
+    signal?: AbortSignal,
+  ) => Promise<void>;
 
   constructor(options: OpenAICompatProviderOptions) {
     if (!options.base_url || !options.base_url.trim()) {
@@ -280,12 +284,25 @@ export class OpenAICompatProvider implements LLMProvider {
 
       let response: Response;
       try {
-        response = await this.fetchImpl(url, {
-          method: "POST",
-          headers: this.headers(),
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
+        // Chrome 142+ Local Network Access: HTTPS pages calling
+        // `http://localhost:…` are blocked as mixed content unless we
+        // opt in via `targetAddressSpace`. `withLnaInit` is a no-op
+        // for public endpoints, so this is safe across providers.
+        // The cast is unavoidable: the field isn't in the standard
+        // `RequestInit` typings yet. Browsers that don't recognise
+        // it ignore it silently.
+        response = await this.fetchImpl(
+          url,
+          withLnaInit(
+            {
+              method: "POST",
+              headers: this.headers(),
+              body: JSON.stringify(body),
+              signal: controller.signal,
+            },
+            url,
+          ) as RequestInit,
+        );
       } catch (err: unknown) {
         clearTimeout(timeout);
         request.signal?.removeEventListener("abort", onOuterAbort);
@@ -392,7 +409,9 @@ export class OpenAICompatProvider implements LLMProvider {
     return h;
   }
 
-  private buildPayload(request: ChatRequest & { model: string }): Record<string, unknown> {
+  private buildPayload(
+    request: ChatRequest & { model: string },
+  ): Record<string, unknown> {
     const payload: Record<string, unknown> = {
       model: request.model,
       messages: request.messages.map((m: Message) => ({
@@ -543,40 +562,49 @@ export function explainFetchFailure(err: unknown, url: string): string {
   if (/Failed to fetch|Load failed|NetworkError/i.test(msg)) {
     let hostname = url;
     let scheme = "";
-    let is_loopback = false;
-    let is_private = false;
     try {
       const parsed = new URL(url);
       hostname = parsed.hostname;
       scheme = parsed.protocol; // "http:" / "https:"
-      is_loopback = isLoopbackHost(hostname);
-      is_private = is_loopback || isPrivateHost(hostname);
     } catch {
       /* keep raw url */
     }
+    const space = targetAddressSpaceFor(url);
+    const is_loopback = space === "loopback";
+    const is_private = is_loopback || space === "local";
     const page_origin = currentOrigin();
     const page_is_https = page_origin?.startsWith("https://") ?? false;
     const target_is_http = scheme === "http:";
 
-    // Mixed content / Private Network Access — most common deploy-time
-    // confusion: an HTTPS page on Vercel/Cloudflare/etc. trying to
-    // reach `http://localhost`. Browsers (Chrome especially) treat
-    // this as a Private Network Access cross-origin request that
-    // requires a server-side opt-in *and* CORS headers Ollama may
-    // not be returning by default. The original "Failed to fetch"
-    // message is too generic to debug from.
+    // HTTPS page → http loopback. Chrome 142+ enforces this through
+    // Local Network Access (LNA): we annotate the fetch with
+    // `targetAddressSpace: "loopback"` so the browser is *willing* to
+    // ask the user for permission, but the user must actually grant
+    // it. If they dismissed the prompt or had it disabled, the call
+    // dies as a generic "Failed to fetch". The hint walks them
+    // through the three reliable recoveries.
     if (page_is_https && target_is_http && is_loopback) {
       return (
         `${msg} (the browser blocked the HTTPS page at ${describeOrigin(page_origin)} ` +
-        `from calling the plaintext loopback URL ${url}). This is a Private ` +
-        `Network Access / mixed-content rejection, not a bug in epublatejs. ` +
-        `Three known-good fixes: (1) run the SPA from http://localhost (e.g. ` +
-        `\`npm run dev\` or \`npm run preview\`), since loopback→loopback ` +
-        `over HTTP is allowed; (2) put Ollama behind an HTTPS reverse proxy ` +
-        `(\`tailscale serve --https=11434 http://127.0.0.1:11434\`, ` +
-        `\`cloudflared tunnel\`, \`ngrok http 11434\`) and paste the HTTPS ` +
-        `URL in Settings; (3) launch Chrome with PNA disabled — \`open -na ` +
-        `"Google Chrome" --args --disable-features=BlockInsecurePrivateNetworkRequests\`. ` +
+        `from calling the plaintext loopback URL ${url}). Chrome 142+ uses ` +
+        `Local Network Access (LNA): epublatejs already requests permission ` +
+        `via \`fetch(..., { targetAddressSpace: "loopback" })\`, but Chrome ` +
+        `must prompt you and you must Allow it. ` +
+        `Fix paths in order of reliability: ` +
+        `(1) run the SPA from http://localhost — \`npm run dev\` or ` +
+        `\`npm run preview\`, since loopback→loopback over HTTP needs no ` +
+        `permission at all; ` +
+        `(2) tunnel Ollama through HTTPS — \`tailscale serve --https=11434 ` +
+        `http://127.0.0.1:11434\`, \`cloudflared tunnel --url ` +
+        `http://localhost:11434\`, or \`ngrok http 11434\` — and paste the ` +
+        `HTTPS URL in Settings; ` +
+        `(3) re-grant the LNA permission for ${describeOrigin(page_origin)} ` +
+        `at chrome://settings/content (look for "Local Network Access" / ` +
+        `"Loopback Network") — or, if the prompt never appears, disable LNA ` +
+        `via chrome://flags (search for "Local Network Access") and restart ` +
+        `the browser. The legacy Chrome flag ` +
+        `\`--disable-features=BlockInsecurePrivateNetworkRequests\` does NOT ` +
+        `help here — it targeted the deprecated PNA system, not LNA. ` +
         `Confirm Ollama itself is reachable with: \`curl -i ` +
         `${describeUrlOrigin(url) ?? "http://localhost:11434"}/v1/models\`.`
       );
@@ -585,9 +613,10 @@ export function explainFetchFailure(err: unknown, url: string): string {
       return (
         `${msg} (the browser blocked the HTTPS page at ${describeOrigin(page_origin)} ` +
         `from calling the plaintext private-network URL ${url}). This is a ` +
-        `Private Network Access / mixed-content rejection. Either move the ` +
-        `endpoint behind HTTPS (Tailscale, Cloudflare Tunnel, ngrok) or run ` +
-        `the SPA from http:// itself.`
+        `Local Network Access / mixed-content rejection. Either move the ` +
+        `endpoint behind HTTPS (Tailscale, Cloudflare Tunnel, ngrok), run ` +
+        `the SPA from http:// itself, or grant the LNA permission at ` +
+        `chrome://settings/content/localNetworkAccess.`
       );
     }
     if (is_loopback) {
@@ -612,30 +641,6 @@ export function explainFetchFailure(err: unknown, url: string): string {
     );
   }
   return msg;
-}
-
-function isLoopbackHost(hostname: string): boolean {
-  return (
-    hostname === "localhost" ||
-    hostname === "127.0.0.1" ||
-    hostname === "[::1]" ||
-    hostname === "::1"
-  );
-}
-
-function isPrivateHost(hostname: string): boolean {
-  // RFC 1918 + link-local + ULA. Cheap regex; we only use it for
-  // user-facing diagnostics so false negatives just fall through to
-  // the generic message.
-  return (
-    /^10\./.test(hostname) ||
-    /^192\.168\./.test(hostname) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
-    /^169\.254\./.test(hostname) ||
-    /^fe80:/i.test(hostname) ||
-    /^fc[0-9a-f]{2}:/i.test(hostname) ||
-    /^fd[0-9a-f]{2}:/i.test(hostname)
-  );
 }
 
 function currentOrigin(): string | null {

@@ -592,6 +592,45 @@ Ollama disables browser CORS by default. Run it with `OLLAMA_ORIGINS=*` (or a sp
 OLLAMA_ORIGINS=* ollama serve
 ```
 
+If you launched Ollama via `launchctl` (the default on macOS via the Ollama desktop app) the env var must be set on the daemon, not your shell:
+
+```bash
+launchctl setenv OLLAMA_ORIGINS '*'
+launchctl kickstart -k user/$UID/com.ollama.ollama
+```
+
+Verify it's actually being honoured:
+
+```bash
+curl -i \
+  -H 'Origin: https://your-deployment.example.app' \
+  http://127.0.0.1:11434/v1/models
+# response must include `Access-Control-Allow-Origin`
+```
+
+### My HTTPS deploy can't reach `http://localhost:11434`
+
+This is the one that bites the hardest after a `vercel deploy`. The error toast you'll see is "Failed to fetch (the browser blocked the HTTPS page at https://… from calling the plaintext loopback URL http://localhost:11434/…)". It's **not** CORS, and **not** a bug in epublatejs — Chrome 142+ enforces a model called **Local Network Access (LNA)**: an HTTPS page calling `http://localhost:…` is blocked as mixed content unless the fetch is annotated with `targetAddressSpace: "loopback"` *and* the user has granted the LNA permission for that origin. `OLLAMA_ORIGINS=*` (CORS) does not bypass either of those checks.
+
+epublatejs already passes `targetAddressSpace: "loopback"` on every fetch to a loopback / RFC1918 endpoint (see [`src/llm/private_network.ts`](../src/llm/private_network.ts)), so Chrome *will* prompt you the first time you press **Test connection** in Settings or run a batch. After that, four known-good fixes in order of convenience:
+
+1. **Click Allow on Chrome's "Local Network Access" prompt.** It only appears once per origin and persists. If you accidentally dismissed it, re-grant it at `chrome://settings/content` (look for *"Local Network Access"* / *"Loopback Network"* — the section name was split in Chrome 145).
+2. **Run the SPA over HTTP locally.** `npm run dev` (Vite, port 5173) or `npm run preview` (port 4173) is loopback→loopback over HTTP — Chrome treats it as a Secure Context, no LNA prompt, no mixed content. This is the friction-free path for solo curating.
+3. **Put Ollama behind HTTPS** and paste the new URL into Settings → LLM endpoint:
+   ```bash
+   # Tailscale (recommended — no extra cert work):
+   tailscale serve --https=11434 http://127.0.0.1:11434
+
+   # Cloudflare Tunnel:
+   cloudflared tunnel --url http://localhost:11434
+
+   # ngrok:
+   ngrok http 11434
+   ```
+4. **Disable LNA wholesale via chrome://flags** for dev work — visit `chrome://flags`, search for *"Local Network Access"*, set the flag to *Disabled*, and restart Chrome. The legacy command-line flag `--disable-features=BlockInsecurePrivateNetworkRequests` is a no-op in Chrome 142+ — it targeted the deprecated Private Network Access (PNA) system that LNA replaced.
+
+The Settings → LLM endpoint card surfaces an inline LNA warning under the Base URL field whenever it detects this configuration, before you press **Test connection**, so a fresh deploy never traps you in the "Failed to fetch" loop without recourse.
+
 ### `epubcheck` complains about a chapter
 
 The most common causes (all fixed in this build, kept here for diagnosis):

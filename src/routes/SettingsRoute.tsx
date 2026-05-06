@@ -745,29 +745,45 @@ function MixedContentWarning({
       role="status"
       className="rounded-md border border-amber-300/40 bg-amber-50/70 px-3 py-2 text-xs leading-relaxed text-amber-900 dark:border-amber-500/30 dark:bg-amber-950/30 dark:text-amber-200"
     >
-      <strong className="font-semibold">Mixed-content warning.</strong>{" "}
-      This page is served over <code>https://</code>, so the browser
-      will refuse to call <code>{trimmed}</code> directly — that's a{" "}
-      Private Network Access / mixed-content rejection, not a bug in
-      epublatejs. Use one of:{" "}
+      <strong className="font-semibold">
+        Mixed-content / Local Network Access warning.
+      </strong>{" "}
+      This page is served over <code>https://</code> while{" "}
+      <code>{trimmed}</code> is plaintext loopback. epublatejs already
+      annotates the fetch with{" "}
+      <code>targetAddressSpace: "loopback"</code>, which lets Chrome
+      142+ <em>ask</em> for permission via the Local Network Access
+      prompt. If the call still fails, walk through these in order:
       <ol className="mt-1 list-decimal space-y-0.5 pl-5">
         <li>
-          Run the SPA from <code>http://localhost</code> (e.g.{" "}
-          <code>npm run dev</code> or <code>npm run preview</code>).
+          When you press <strong>Test connection</strong>, watch for
+          Chrome's "Local Network Access" prompt and click{" "}
+          <em>Allow</em>. If you previously dismissed it, re-grant it
+          at <code>chrome://settings/content</code> (look for{" "}
+          <em>"Local Network Access"</em> /{" "}
+          <em>"Loopback Network"</em>).
         </li>
         <li>
-          Tunnel Ollama through HTTPS (
-          <code>tailscale serve --https=11434 http://127.0.0.1:11434</code>
-          , <code>cloudflared tunnel</code>, or <code>ngrok http 11434</code>
-          ) and paste the HTTPS URL here.
+          Run the SPA from <code>http://localhost</code> (
+          <code>npm run dev</code> or <code>npm run preview</code>) —
+          loopback→loopback over HTTP needs no permission at all.
         </li>
         <li>
-          Launch a dev Chrome with PNA disabled —{" "}
+          Tunnel Ollama through HTTPS so it stops being mixed content:{" "}
           <code>
-            open -na "Google Chrome" --args
-            --disable-features=BlockInsecurePrivateNetworkRequests
+            tailscale serve --https=11434 http://127.0.0.1:11434
           </code>
-          .
+          ,{" "}
+          <code>cloudflared tunnel --url http://localhost:11434</code>
+          , or <code>ngrok http 11434</code>. Paste the HTTPS URL
+          here.
+        </li>
+        <li>
+          As a last resort, disable LNA in <code>chrome://flags</code>{" "}
+          (search for <em>"Local Network Access"</em>) and restart
+          the browser. The legacy{" "}
+          <code>BlockInsecurePrivateNetworkRequests</code> flag does
+          nothing in Chrome 142+.
         </li>
       </ol>
     </p>

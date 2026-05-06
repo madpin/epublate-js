@@ -22,6 +22,7 @@ import {
   EmbeddingHttpError,
   EmbeddingRateLimitError,
 } from "./base";
+import { withLnaInit } from "../private_network";
 
 const DEFAULT_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([
   408, 409, 500, 502, 503, 504,
@@ -228,12 +229,22 @@ export class OpenAICompatEmbeddingProvider implements EmbeddingProvider {
 
       let response: Response;
       try {
-        response = await this.fetchImpl(url, {
-          method: "POST",
-          headers: this.headers(),
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
+        // Match the chat path: opt into Chrome's Local Network Access
+        // when the embedding endpoint is loopback / RFC1918, so HTTPS
+        // deploys can reach a local Ollama embedding server. See
+        // `src/llm/private_network.ts` for the rules.
+        response = await this.fetchImpl(
+          url,
+          withLnaInit(
+            {
+              method: "POST",
+              headers: this.headers(),
+              body: JSON.stringify(body),
+              signal: controller.signal,
+            },
+            url,
+          ) as RequestInit,
+        );
       } catch (err: unknown) {
         clearTimeout(timeout);
         signal?.removeEventListener("abort", onOuterAbort);
