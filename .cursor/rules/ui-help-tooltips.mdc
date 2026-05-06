@@ -1,0 +1,98 @@
+---
+description: Inline help-tooltip pattern for non-trivial form fields.
+globs: src/{components,routes}/**/*.{ts,tsx}
+alwaysApply: false
+---
+
+# Inline help tooltips
+
+Form fields whose meaning, units, or sensible default isn't obvious
+from the label alone get an inline help icon. The icon opens a Radix
+tooltip carrying long-form prose — explanation, defaults, recommended
+values, and caveats. Curators don't have to read external docs for
+the common case; the answer is one keypress away.
+
+## Use it for
+
+- **Numeric knobs with non-obvious units** (`num_ctx`, `timeout_ms`,
+  `error_window_size`): explain the unit and a default value.
+- **Provider-specific fields** (`reasoning_effort`, Ollama
+  `think: false`): explain which providers honour it and what the
+  trade-offs are.
+- **Settings that interact** (per-segment retry vs provider retry,
+  reasoning effort vs Ollama `think`): cross-link the related field
+  in plain prose.
+- **Toggles whose default surprised someone** ("we default this off
+  because…"): bake the rationale into the tooltip so curators don't
+  have to re-discover it from the changelog.
+
+## Skip it for
+
+- Trivial text inputs whose label is self-describing (project name,
+  language slugs).
+- Internal / dev-only screens (`?mock=1` debug pages).
+- Errors / inline validation messages — those are *always* visible,
+  not gated on hover.
+
+## Building block — `FieldHelp`
+
+Every form should reach for `@/components/ui/field-help` — the
+shared primitive for "label + question-mark icon → tooltip". Don't
+hand-roll the pattern with bare Radix tooltips per form; consistency
+matters here.
+
+```tsx
+import { FieldHelp } from "@/components/ui/field-help";
+
+<FieldHelp
+  htmlFor="num_ctx"
+  label="Context window (num_ctx)"
+  help={
+    <>
+      <p>
+        Tokens loaded into context per request. Ollama default is{" "}
+        <code>2048</code>; bump to <code>8192</code> for chapter-sized
+        prompts.
+      </p>
+      <p className="mt-2">
+        Doubling the window roughly doubles memory cost; if Ollama
+        OOMs, drop back to 4096.
+      </p>
+    </>
+  }
+/>
+<Input id="num_ctx" type="number" placeholder="2048" … />
+```
+
+## Accessibility contract
+
+`FieldHelp` is wired so:
+
+- The visible `<label htmlFor>` is the input's accessible name.
+- The help icon has its own distinct aria-label (`Show help: <label>`)
+  so `getByLabelText(/<label>/)` in tests still uniquely returns the
+  input, not the help button.
+- The tooltip is keyboard-reachable: tabbing to the help button opens
+  it; the tooltip body uses Radix and respects screen-reader output.
+
+## Tooltip prose conventions
+
+- One topic, one short paragraph; up to two paragraphs separated by
+  `<p className="mt-2">`.
+- Inline `<code>` for default values, units, and field references
+  (e.g. `<code>num_ctx</code>`, `<code>2048</code>`).
+- Mention the **default**, the **unit**, and one practical
+  recommendation — not three.
+- Cross-link interacting fields in plain English (`see Settings → LLM →
+  Reasoning effort`), don't try to render Settings-route paths in
+  pseudo-breadcrumbs.
+
+## Don't
+
+- Don't put help-icon tooltips on read-only display values — those
+  belong inline (e.g. a footnote or a disclosure card).
+- Don't use a help tooltip as a workaround for a confusing field
+  name. Rename the field if the tooltip starts with "actually this is
+  named X for legacy reasons…".
+- Don't bury validation errors inside a help tooltip; they need to be
+  on-screen the moment they apply.
