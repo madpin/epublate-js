@@ -27,8 +27,13 @@ export interface ChatRequest {
   response_format?: ResponseFormat;
   temperature?: number;
   seed?: number;
-  /** OpenAI-style reasoning knob; permissive endpoints silently ignore. */
-  reasoning_effort?: "minimal" | "low" | "medium" | "high";
+  /**
+   * OpenAI-style reasoning knob plus the Ollama-compat `"none"`
+   * extension that disables thinking on thinking-capable models
+   * (Qwen 3, DeepSeek-R1, Gemma 3 thinking, GPT-OSS reasoning).
+   * Permissive endpoints silently ignore unknown values.
+   */
+  reasoning_effort?: "minimal" | "low" | "medium" | "high" | "none";
   /** Request-cancellation hook (forwarded to fetch / mock). */
   signal?: AbortSignal;
 }
@@ -46,6 +51,11 @@ export interface ChatResult {
   cache_hit: boolean;
   /** Raw response payload for the audit log. */
   raw: unknown;
+  /**
+   * Wall-clock duration of the call, including retries, in milliseconds.
+   * `null` when the provider didn't measure (e.g. mock with no clock).
+   */
+  duration_ms?: number | null;
 }
 
 export interface LLMProvider {

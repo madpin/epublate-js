@@ -150,6 +150,7 @@ src/
 │   ├── openai_compat.ts     /v1/chat/completions HTTP provider
 │   ├── mock.ts              deterministic mock used by tests + ?mock=1
 │   ├── factory.ts           build provider from library + per-project config
+│   ├── ollama.ts            Ollama-specific options + presets + sanitizer
 │   ├── json_mode.ts         "JSON mode → text fallback" wrapper
 │   ├── tokens.ts            gpt-tokenizer wrapper
 │   ├── pricing.ts           static price table + curator overrides
@@ -415,10 +416,21 @@ The callback trio (`on_progress` / `on_segment_start` / `on_segment_end`) is wha
 3. **Failure isolation.** Per-segment failures are caught inside the worker, recorded as `batch.segment_failed` events, and added to `summary.failures`. They never abort the batch.
 4. **Cancellation.** The `AbortSignal` is checked between worker iterations and propagated to the LLM call so `fetch` aborts promptly. The runner throws `BatchCancelled` (carrying the partial summary).
 
+### Resilience layer (per-segment retry + circuit breaker)
+
+A flaky local LLM endpoint used to drag whole batches into the Inbox one segment at a time. The worker now wraps `translateSegment` in a two-tier guard, both knobs configurable via `BatchOptions.retry: BatchRetryConfig` (defaults in `BATCH_RETRY_DEFAULTS`):
+
+1. **Per-segment retry budget** — `max_retries_per_segment` (default `2`). On a transient failure (network error, abort-as-timeout, JSON parse glitch) the worker re-runs the same segment with the same prompt up to N more times before recording a `summary.failures` entry. Provider-level retries (`Retry-After`-aware exponential backoff) still happen first; this is the second line of defence above them. Each attempt writes a `batch.segment_retry` event capturing `attempt`, `error`, and the `next_delay_ms` jitter so the audit ledger records the recovery story. Validator violations and cancellations are *not* retried — they are deterministic outcomes.
+
+2. **Sliding-window circuit breaker** — `error_window_size` × `max_errors_in_window` (defaults `100` × `10`). The runner keeps a rolling outcome ring of the last W segments; when failures inside the window cross threshold T the batch pauses with `pause_reason = "circuit breaker tripped: <count>/<window> segments failed in the recent window"`. Recovery clears the window on Resume. Successful segments age out naturally, so a brief network blip doesn't trip the breaker. Each trip writes a `batch.circuit_breaker` event.
+
+`resolveBatchRetryConfig` clamps malformed inputs (negative numbers, threshold larger than window) so the curator can't silently disable the breaker by typing the wrong order. The curator-facing UI lives in `src/components/settings/BatchReliabilityCard.tsx`; see [USAGE → Batch reliability](USAGE.md#batch-reliability-retry--circuit-breaker).
+
 ### Pause reasons
 
 - **Budget cap** → `paused_reason = "budget cap $X.XXX reached at $Y.YYY"`. The status bar offers a Resume action that re-issues the batch with a higher cap.
 - **Rate limit** → `LLMRateLimitError` from the provider. The runner pauses and surfaces the retry-after window in the status bar's title. Concurrency-bound flows (OpenRouter free tier, OpenAI's per-minute caps) drive this.
+- **Circuit breaker tripped** → repeated transient failures crossed the configured threshold (see above). Resume after fixing the underlying issue (Ollama tunnel down, model unloaded, tunnel cert rotated, …).
 
 ### Optional helper-LLM pre-pass
 
@@ -554,7 +566,10 @@ Speaks `/v1/chat/completions`. Works against OpenAI, Azure OpenAI, OpenRouter, T
 
 - **Retry loop with full-jitter exponential backoff.** Same retry semantics as the Python tool: respects `Retry-After` and `X-RateLimit-Reset` headers up to a `RATE_LIMIT_SHORT_WAIT_CAP_SECONDS = 120` ceiling, then surfaces a typed `LLMRateLimitError` so the orchestrator can pause cleanly.
 - **CORS-aware error mapping.** Browser-side, a CORS rejection comes through as a generic `TypeError`. We catch it and re-throw as `LLMError("network error")` with a hint pointing at the Settings docs.
+- **Configurable per-request timeout with curator-friendly abort copy.** The provider takes a `timeout_ms` (default **120 000 ms**, library/project overridable through `resolveLlmConfig`). Internally it wraps the user-supplied `AbortSignal` with `AbortSignal.any` plus a `setTimeout` that calls `controller.abort(new DOMException("Request timed out after Xs", "TimeoutError"))`. When the call surfaces as a `network error: signal is aborted without reason` we now know whether the abort came from the user (cancel button), a real network failure, or our own timer — and we re-throw with `"timed out after Xs while talking to <url> — increase Request timeout in Settings → LLM, or disable thinking on the model"` so the curator gets actionable advice. See `OpenAICompatProvider.chat`.
 - **API key never echoed back.** The audit log's `request_json` is built from our own `Message` array, not from the wire payload — so even `?debug=true` query strings can't leak the key.
+- **Optional Ollama options pass-through.** When the resolved config carries `ollama_options`, the provider sanitizes them through `sanitizeOllamaOptions` once on construction and merges them into every chat-completion body. Numeric Modelfile knobs (`num_ctx`, `num_predict`, `temperature`, `top_k`, `top_p`, `repeat_penalty`, `seed`, `mirostat*`) go under a top-level `options` object; the **`think`** boolean (Ollama's reasoning toggle for Gemma 3 / Qwen 3 / DeepSeek-R1 / GPT-OSS) is emitted as a top-level body field per Ollama's REST spec. Cloud providers ignore the unknown fields; Ollama maps them onto its native knobs. The schema, defaults, presets, sanitizer, and `buildOllamaBodyExtras` live in `src/llm/ollama.ts`; the curator-side card is `src/components/settings/OllamaOptionsCard.tsx`. See [USAGE → Ollama options](USAGE.md#ollama-options-optional-auto-detected).
+- **Reasoning effort with the `none` Ollama-compat extension.** `reasoning_effort` accepts the standard OpenAI o-series ladder (`minimal` / `low` / `medium` / `high`) plus **`none`**, which Ollama-compatible endpoints honour as "skip the thinking phase". Cloud providers that don't recognise the value just ignore the field. Project-level overrides flow through `resolveLlmConfig` so a single library default can be tightened per project.
 
 ### `MockProvider`
 
@@ -793,6 +808,48 @@ Each component:
 `estimateCost(model, prompt_tokens, completion_tokens)` is the function the pipeline calls to populate `llm_call.cost_usd`. Cache hits set `cost_usd = 0` regardless of what the cached row originally cost; this is what lets the budget cap be a meaningful guardrail across re-runs.
 
 `core/stats.ts` aggregates the audit ledger into the Dashboard's progress card values: `LLM spend (lifetime)`, cache rate, prompt/completion totals, etc. It's the read-only counterpart of the audit ledger and is the single source of truth for "how much has this project cost so far".
+
+### PWA caching layers
+
+epublate ships as a static SPA but registers a service worker via `vite-plugin-pwa` (configuration in [vite.config.ts](../vite.config.ts), registration in [src/main.tsx](../src/main.tsx)). Three independent caches collaborate so the curator can install the app and use it offline; understanding which cache holds which artifact is the difference between "I just lost my book" and "I refreshed the tab".
+
+```mermaid
+flowchart LR
+  curator([Curator])
+  subgraph offline_capable [Offline-capable]
+    direction TB
+    shell["App shell<br/>(precache + Workbox runtime)"]
+    idb[("IndexedDB<br/>library, project, lore<br/>= every Dexie table")]
+    cache_storage[("Cache Storage<br/>transformers-cache,<br/>epublate-onnx-runtime,<br/>epublate-hf-models")]
+  end
+  subgraph network_required [Requires network]
+    direction TB
+    llm["LLM /chat/completions<br/>(fresh translations only;<br/>cache-hits replay offline)"]
+    embed_remote["Remote embeddings<br/>(only when openai-compat<br/>provider is selected)"]
+    hf_first["Initial HF model pull<br/>(first activation only,<br/>after consent)"]
+  end
+  curator --> shell
+  shell <--> idb
+  shell <--> cache_storage
+  shell -. only when needed .-> llm
+  shell -. only when needed .-> embed_remote
+  shell -. only first activation .-> hf_first
+```
+
+| Layer                              | Backed by                                     | Holds                                                                                       | Lifecycle                                                                                                                  |
+| ---------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| **Workbox precache**               | `workbox-precaching` (auto-generated)         | The SPA shell — every `.js`, `.css`, `.html`, `.svg`, `.woff2`, `.wasm`, `.webp`, `.json`. | Refreshed on every deploy; `cleanupOutdatedCaches: true` drops stale revisions. Bumped `maximumFileSizeToCacheInBytes` to 10 MiB so transformers tokenizer chunks aren't silently skipped. |
+| **`epublate-onnx-runtime`**        | Workbox `runtimeCaching` (`CacheFirst`)        | ONNX runtime WASM from `cdn.jsdelivr.net/npm/@xenova/transformers/*`.                       | 30-day TTL, 50-entry cap. Hash-pinned URL means repeated visits are zero-byte.                                              |
+| **`epublate-hf-models`**           | Workbox `runtimeCaching` (`CacheFirst`)        | `huggingface.co/Xenova/*` model weight blobs.                                              | 365-day TTL, 200-entry cap. Belt-and-suspenders against transformers.js's own `transformers-cache`. Content-addressed → safe to keep for a year. |
+| **`transformers-cache`**           | `@xenova/transformers` Cache Storage           | Same model weights, keyed by transformers.js's own URL scheme.                              | Wiped only when the curator clears site data or the cache-purge migration fires (see [src/llm/embeddings/local.ts](../src/llm/embeddings/local.ts)). |
+| **IndexedDB (Dexie)**              | Browser-native                                  | Library, every project DB, every lore-book DB. Contains the curator's actual *work*.       | Persisted across browser updates; survives PWA reinstall. Eviction protected by `navigator.storage.persist()` on first use. |
+| **Service-worker lifecycle flag**  | `localStorage`                                  | One key (`epublate-offline-ready`) flipped by `onOfflineReady`.                            | Pure UX flag; clearing localStorage just makes Settings → Install say "Caching app for offline use…" until next activation. |
+
+The two `runtimeCaching` rules above are the *only* third-party origins epublate ever fetches at runtime — both are explicitly allow-listed in [.cursor/rules/no-network-side-effects.mdc](../.cursor/rules/no-network-side-effects.mdc). Adding any other origin is a privacy regression and a rule violation.
+
+The install affordance lives in [src/components/settings/InstallCard.tsx](../src/components/settings/InstallCard.tsx) and is wired through three small hooks under [src/hooks/](../src/hooks/) — `usePwaInstall`, `useOnlineStatus`, `useOfflineReady` — each with colocated tests. The sidebar footer in [src/components/layout/AppShell.tsx](../src/components/layout/AppShell.tsx) renders the same hooks as a compact "Install" button + offline pill so curators see the state without leaving whatever screen they're on.
+
+`onNeedRefresh` triggers a sticky sonner toast with a "Reload now" action that calls `updateSW(true)` so installed users pick up new builds without manually closing the standalone window. There is no autoupdate channel that calls third parties: the new build comes from the same origin as the SPA itself.
 
 ---
 

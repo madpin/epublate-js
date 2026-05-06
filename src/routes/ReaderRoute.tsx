@@ -108,7 +108,7 @@ const STATUS_GLYPH: Record<SegmentStatusT, string> = {
 interface ProviderHandle {
   provider: LLMProvider;
   model: string;
-  reasoning_effort: "minimal" | "low" | "medium" | "high" | null;
+  reasoning_effort: "minimal" | "low" | "medium" | "high" | "none" | null;
 }
 
 export function ReaderRoute(): React.JSX.Element {

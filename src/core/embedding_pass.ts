@@ -62,6 +62,15 @@ export interface EmbeddingPassOptions {
   batch_size_override?: number | null;
   /** Optional progress callback fired after each batch. */
   on_progress?: (info: EmbeddingPassProgress) => void;
+  /**
+   * Number of batches the pass will dispatch concurrently. Defaults
+   * to 4. Each batch already covers `provider.batch_size` segments,
+   * so 4 concurrent batches typically mean 256 segments in flight per
+   * round-trip wave. Bump higher for local providers (Ollama, on-device
+   * Xenova) where there's no rate-limit. Set to 1 to keep the v1
+   * sequential behaviour.
+   */
+  parallel_batches?: number;
   /** AbortSignal — cancels remaining batches but lets the current one finish. */
   signal?: AbortSignal;
 }
@@ -192,82 +201,111 @@ export async function runEmbeddingPass(
   let dispatched = 0;
   let cancelled = false;
 
+  // Pre-slice pending into deterministic batches so concurrent
+  // workers don't double-claim a segment. Each batch is a contiguous
+  // slice of `pending` so spine order is preserved across the pass.
+  const slices: SegmentRow[][] = [];
   for (let i = 0; i < pending.length; i += batch_size) {
-    if (options.signal?.aborted) {
-      cancelled = true;
-      break;
-    }
-    const slice = pending.slice(i, i + batch_size);
-    const texts = slice.map((s) => s.source_text);
-    dispatched += 1;
-    try {
-      const result = await provider.embed(texts, options.signal);
-      const inserts: UpsertEmbeddingInput[] = [];
-      for (let k = 0; k < slice.length; k += 1) {
-        const seg = slice[k]!;
-        const vec = result.vectors[k];
-        if (!vec) continue;
-        inserts.push({
-          scope: "segment",
-          ref_id: seg.id,
+    slices.push(pending.slice(i, i + batch_size));
+  }
+
+  const parallel = Math.max(1, options.parallel_batches ?? 4);
+
+  let cursor = 0;
+  const dispatchOne = async (): Promise<void> => {
+    while (true) {
+      if (options.signal?.aborted) {
+        cancelled = true;
+        return;
+      }
+      const i = cursor++;
+      if (i >= slices.length) return;
+      const slice = slices[i]!;
+      const texts = slice.map((s) => s.source_text);
+      dispatched += 1;
+      try {
+        const result = await provider.embed(texts, options.signal);
+        const inserts: UpsertEmbeddingInput[] = [];
+        for (let k = 0; k < slice.length; k += 1) {
+          const seg = slice[k]!;
+          const vec = result.vectors[k];
+          if (!vec) continue;
+          inserts.push({
+            scope: "segment",
+            ref_id: seg.id,
+            model: provider.model,
+            vector: vec,
+          });
+        }
+        if (inserts.length) {
+          await bulkUpsertEmbeddings("project", project_id, inserts);
+          embedded += inserts.length;
+        } else {
+          cached_batches += 1;
+        }
+        const prompt_tokens = result.usage?.prompt_tokens ?? 0;
+        total_prompt_tokens += prompt_tokens;
+        const cost_usd = estimateCost(provider.model, prompt_tokens, 0);
+        total_cost += cost_usd;
+        // Audit ledger entry for the batch — keeps embedding spend
+        // visible alongside translation calls.
+        await insertLlmCall(project_id, {
+          id: newId(),
+          project_id,
+          segment_id: null,
           model: provider.model,
-          vector: vec,
+          purpose: PURPOSE_EMBEDDING,
+          request_json: JSON.stringify({
+            provider: provider.name,
+            model: provider.model,
+            scope: "segment",
+            kind: "embedding_pass",
+            batch_idx: i,
+            input_count: slice.length,
+            segment_ids: slice.map((s) => s.id),
+          }),
+          response_json: JSON.stringify({
+            vectors: inserts.length,
+            dim: result.vectors[0]?.length ?? null,
+            model: result.model,
+            usage: result.usage,
+            duration_ms: result.duration_ms ?? null,
+            raw: result.raw,
+          }),
+          prompt_tokens,
+          completion_tokens: 0,
+          cost_usd,
+          cache_hit: false,
+          cache_key: null,
+          duration_ms: result.duration_ms ?? null,
+        });
+      } catch (err) {
+        failed_batches += 1;
+        const message = err instanceof Error ? err.message : String(err);
+        await appendEvent(project_id, "embedding.failed", {
+          model: provider.model,
+          batch_idx: i,
+          error: message,
+          cause: err instanceof EmbeddingError ? "provider" : "unknown",
         });
       }
-      if (inserts.length) {
-        await bulkUpsertEmbeddings("project", project_id, inserts);
-        embedded += inserts.length;
-      } else {
-        cached_batches += 1;
-      }
-      const prompt_tokens = result.usage?.prompt_tokens ?? 0;
-      total_prompt_tokens += prompt_tokens;
-      const cost_usd = estimateCost(provider.model, prompt_tokens, 0);
-      total_cost += cost_usd;
-      // Audit ledger entry for the batch — keeps embedding spend
-      // visible alongside translation calls.
-      await insertLlmCall(project_id, {
-        id: newId(),
-        project_id,
-        segment_id: null,
-        model: provider.model,
-        purpose: PURPOSE_EMBEDDING,
-        request_json: JSON.stringify({
-          provider: provider.name,
-          model: provider.model,
-          batch: slice.length,
-        }),
-        response_json: JSON.stringify({
-          vectors: inserts.length,
-          dim: result.vectors[0]?.length ?? null,
-        }),
-        prompt_tokens,
-        completion_tokens: 0,
-        cost_usd,
-        cache_hit: false,
-        cache_key: null,
-      });
-    } catch (err) {
-      failed_batches += 1;
-      const message = err instanceof Error ? err.message : String(err);
-      await appendEvent(project_id, "embedding.failed", {
-        model: provider.model,
-        batch_idx: dispatched - 1,
-        error: message,
-        cause:
-          err instanceof EmbeddingError ? "provider" : "unknown",
+
+      options.on_progress?.({
+        embedded,
+        total_pending: pending.length,
+        batches: dispatched,
+        cached_batches,
+        failed_batches,
+        cost_usd: total_cost,
       });
     }
+  };
 
-    options.on_progress?.({
-      embedded,
-      total_pending: pending.length,
-      batches: dispatched,
-      cached_batches,
-      failed_batches,
-      cost_usd: total_cost,
-    });
-  }
+  await Promise.all(
+    Array.from({ length: Math.min(parallel, slices.length) }, () =>
+      dispatchOne(),
+    ),
+  );
 
   const finished_at = Date.now();
   const status_t =

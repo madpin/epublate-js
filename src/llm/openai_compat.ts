@@ -32,6 +32,12 @@ import {
   LLMRateLimitError,
   LLMResponseError,
 } from "./base";
+import {
+  type OllamaOptions,
+  type OllamaOptionsInput,
+  buildOllamaBodyExtras,
+  sanitizeOllamaOptions,
+} from "./ollama";
 
 const DEFAULT_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([
   408, 409, 500, 502, 503, 504,
@@ -45,11 +51,21 @@ const DEFAULT_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([
  */
 const RATE_LIMIT_SHORT_WAIT_CAP_SECONDS = 120.0;
 
+/**
+ * Recognized `reasoning_effort` values. The first four are the
+ * OpenAI o-series convention; `"none"` is the Ollama-compat
+ * extension that disables thinking on thinking-capable models
+ * (Qwen 3, DeepSeek-R1, Gemma 3 thinking, etc.) — see
+ * https://github.com/ollama/ollama/issues/14820. We forward the
+ * field verbatim; providers that don't recognise a given value
+ * silently ignore it.
+ */
 const VALID_REASONING_EFFORTS = new Set([
   "minimal",
   "low",
   "medium",
   "high",
+  "none",
 ] as const);
 
 export interface RetryPolicy {
@@ -67,6 +83,17 @@ export const DEFAULT_RETRY_POLICY: RetryPolicy = {
   multiplier: 2.0,
   jitter: true,
 };
+
+/**
+ * Monotonic wall-clock reader. Falls back to `Date.now()` in
+ * environments without `performance` (deeply old workers).
+ */
+function nowMillis(): number {
+  if (typeof performance !== "undefined" && performance.now) {
+    return performance.now();
+  }
+  return Date.now();
+}
 
 function delayFor(policy: RetryPolicy, attempt: number): number {
   if (attempt <= 0) return 0;
@@ -104,7 +131,18 @@ export interface OpenAICompatProviderOptions {
   /** Total request timeout in milliseconds; default 60s. */
   timeout_ms?: number;
   retry_policy?: Partial<RetryPolicy>;
-  reasoning_effort?: "minimal" | "low" | "medium" | "high" | null;
+  reasoning_effort?: "minimal" | "low" | "medium" | "high" | "none" | null;
+  /**
+   * Optional Ollama-specific runtime options. Forwarded to the
+   * endpoint as a top-level `options` body field on every request,
+   * which cloud providers silently ignore and Ollama interprets as
+   * Modelfile knobs (`num_ctx`, `num_predict`, …). The provider
+   * sanitizes the blob through `sanitizeOllamaOptions` on
+   * construction so a malformed library row can't poison every
+   * request. Accepts the permissive `OllamaOptionsInput` (matches
+   * the persisted Dexie shape).
+   */
+  ollama_options?: OllamaOptionsInput | null;
   /**
    * Optional `fetch` override. Tests inject a mocked fetch; the
    * production code uses the global.
@@ -133,7 +171,9 @@ export class OpenAICompatProvider implements LLMProvider {
     | "low"
     | "medium"
     | "high"
+    | "none"
     | null;
+  private readonly ollama_options: OllamaOptions | null;
   private readonly fetchImpl: typeof fetch;
   private readonly sleepImpl: (ms: number, signal?: AbortSignal) => Promise<void>;
 
@@ -175,6 +215,10 @@ export class OpenAICompatProvider implements LLMProvider {
       );
     }
     this.reasoning_effort = options.reasoning_effort ?? null;
+    // Sanitize once on construction so per-request payload building
+    // is allocation-cheap and a malformed library row never reaches
+    // the wire.
+    this.ollama_options = sanitizeOllamaOptions(options.ollama_options ?? null);
     // The native browser `fetch` is a "method on window" — it throws
     // `TypeError: Illegal invocation` if invoked with any other `this`
     // binding. Assigning `globalThis.fetch` to a class field changes
@@ -202,13 +246,34 @@ export class OpenAICompatProvider implements LLMProvider {
     const url = `${this.base_url}/chat/completions`;
     const attempts = this.retry.max_retries + 1;
     let lastErr: unknown = null;
+    // Wall-clock start so we can surface true end-to-end latency
+    // (including retries + Retry-After waits) in the audit ledger.
+    const t0 = nowMillis();
 
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const delay = delayFor(this.retry, attempt);
       if (delay > 0) await this.sleepImpl(delay * 1000, request.signal);
 
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.timeout_ms);
+      // Track whether we ourselves tripped the timeout, so the catch
+      // block can surface "timed out after Xms" instead of the raw
+      // "signal is aborted without reason" the browser hands us.
+      let timed_out = false;
+      const timeout = setTimeout(() => {
+        timed_out = true;
+        // Older browsers ignore the reason argument; the local flag
+        // is the source of truth either way.
+        try {
+          controller.abort(
+            new DOMException(
+              `epublate timeout after ${this.timeout_ms} ms`,
+              "TimeoutError",
+            ),
+          );
+        } catch {
+          controller.abort();
+        }
+      }, this.timeout_ms);
       // Cancel both ways: outer signal + our timeout.
       const onOuterAbort = (): void => controller.abort();
       request.signal?.addEventListener("abort", onOuterAbort, { once: true });
@@ -224,12 +289,31 @@ export class OpenAICompatProvider implements LLMProvider {
       } catch (err: unknown) {
         clearTimeout(timeout);
         request.signal?.removeEventListener("abort", onOuterAbort);
+        // Curator hit Cancel — propagate, don't translate to a
+        // network error. The outer signal is the source of truth
+        // here; our local `timed_out` flag is only set when *we*
+        // tripped the abort.
         if (
           err instanceof DOMException &&
           err.name === "AbortError" &&
           request.signal?.aborted
         ) {
           throw err;
+        }
+        if (timed_out) {
+          // Wrap the abort as a typed timeout error with a curator-
+          // friendly message. Retryable like any other transient
+          // failure, but we keep the message stable so the inbox
+          // / batch failure log is greppable ("timed out after").
+          lastErr = new LLMError(
+            `timed out after ${this.timeout_ms} ms talking to ${url} ` +
+              `(local Ollama with a thinking-capable model on a chapter-sized ` +
+              `prompt routinely needs more — bump Settings → LLM → ` +
+              `Request timeout, or set "Reasoning effort" to "none" / Ollama ` +
+              `options → Disable thinking).`,
+          );
+          if (attempt < attempts - 1) continue;
+          throw lastErr;
         }
         lastErr = err;
         if (attempt < attempts - 1) {
@@ -245,7 +329,9 @@ export class OpenAICompatProvider implements LLMProvider {
 
       if (response.ok) {
         const json = (await response.json()) as ChatCompletionPayload;
-        return parseCompletion(json, model, request.messages);
+        const result = parseCompletion(json, model, request.messages);
+        result.duration_ms = nowMillis() - t0;
+        return result;
       }
 
       const text = await readBody(response);
@@ -320,6 +406,10 @@ export class OpenAICompatProvider implements LLMProvider {
     if (rf) payload.response_format = serializeResponseFormat(rf);
     const re = request.reasoning_effort ?? this.reasoning_effort;
     if (re) payload.reasoning_effort = re;
+    // Ollama-only `options` block. `buildOllamaBodyExtras` returns
+    // an empty object when nothing is configured, so the payload
+    // shape stays unchanged for every other provider.
+    Object.assign(payload, buildOllamaBodyExtras(this.ollama_options));
     return payload;
   }
 }

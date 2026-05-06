@@ -29,6 +29,8 @@ export interface InsertLlmCallInput {
   request_json: string | null;
   response_json: string | null;
   created_at?: number;
+  /** Provider round-trip duration in milliseconds. */
+  duration_ms?: number | null;
 }
 
 export async function insertLlmCall(
@@ -49,6 +51,7 @@ export async function insertLlmCall(
     request_json: input.request_json,
     response_json: input.response_json,
     created_at: input.created_at ?? Date.now(),
+    duration_ms: input.duration_ms ?? null,
   };
   const db = openProjectDb(projectId);
   await db.llm_calls.put(row);

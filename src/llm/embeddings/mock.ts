@@ -55,6 +55,10 @@ export class MockEmbeddingProvider implements EmbeddingProvider {
   }
 
   async embed(texts: string[], signal?: AbortSignal): Promise<EmbeddingResult> {
+    const t0 =
+      typeof performance !== "undefined" && performance.now
+        ? performance.now()
+        : Date.now();
     if (this.delay_ms > 0) {
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(resolve, this.delay_ms);
@@ -70,11 +74,16 @@ export class MockEmbeddingProvider implements EmbeddingProvider {
       vectors.push(await pseudoVector(text, this.dim));
       total_chars += text.length;
     }
+    const duration_ms =
+      (typeof performance !== "undefined" && performance.now
+        ? performance.now()
+        : Date.now()) - t0;
     return {
       vectors,
       model: this.model,
       usage: { prompt_tokens: Math.max(0, Math.ceil(total_chars / 4)) },
       raw: { mock: true, count: texts.length, model: this.model, dim: this.dim },
+      duration_ms,
     };
   }
 }

@@ -40,6 +40,10 @@ export class MockProvider implements LLMProvider {
   }
 
   async chat(request: ChatRequest): Promise<ChatResult> {
+    const t0 =
+      typeof performance !== "undefined" && performance.now
+        ? performance.now()
+        : Date.now();
     if (this.delay_ms > 0) {
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(resolve, this.delay_ms);
@@ -88,6 +92,10 @@ export class MockProvider implements LLMProvider {
       content = JSON.stringify({ target: last_user });
     }
 
+    const duration_ms =
+      (typeof performance !== "undefined" && performance.now
+        ? performance.now()
+        : Date.now()) - t0;
     return {
       content,
       usage: {
@@ -97,6 +105,7 @@ export class MockProvider implements LLMProvider {
       model: request.model,
       cache_hit: false,
       raw: { mock: true, content },
+      duration_ms,
     };
   }
 

@@ -75,10 +75,11 @@ Style guide, context window, budget cap, and per-project LLM overrides — the s
 - **Glossary** with proposed / approved / locked statuses, alias support on both source and target sides, target-only entries (for invented terms), JSON / CSV import-export, and an Inbox flow for cascade re-translation when a locked term changes.
 - **Lore Books**: standalone, attachable per-project lore artifacts. Ingest from a translated reference ePub, ingest from a source ePub via helper LLM, or import from another project. Attach with read-only or writable mode and a per-attachment priority.
 - **Batch runner** with bounded concurrency, hard budget cap, AbortController-based cancel, persistent status bar that survives navigation, helper-LLM pre-pass per chapter (optional), and per-segment failure isolation.
+- **Resilience layer.** Configurable per-segment retry budget on top of the provider's own backoff, plus a sliding-window circuit breaker that pauses the batch when transient failures exceed a threshold (default `10` failures in the last `100` segments) — so a flaky local Ollama tunnel can't drag a whole novel into the Inbox one segment at a time. Configurable timeout per chat-completion call, with a curator-friendly abort message that points back at the relevant Settings knob.
 - **Per-project context window.** Inject up to N preceding segments of the current chapter into the translator prompt as read-only context, with a separate character budget for paragraph-heavy chapters.
 - **RAG-backed lore (optional).** Attach a 5,000-entry series bible without ballooning every prompt: enable the OpenAI-compatible or local embedding provider in Settings → Embeddings and the pipeline retrieves only the Lore-Book entries (and proposed glossary hints) that are semantically relevant to the current segment.
 - **Project bundles** — one-click `.zip` export with the original ePub plus every Dexie row as JSON-Lines, re-importable on any device with a fresh project id (so the same bundle can be imported multiple times without colliding).
-- **PWA-ready**: `vite-plugin-pwa` is wired; the app is installable and works offline (after the first load, cached LLM responses notwithstanding).
+- **Installable & offline-first**. One click in Settings → Install saves the app to your dock / home screen via `vite-plugin-pwa`. Once the shell is cached, every screen — browsing, editing, cache-hit translations, ePub re-export, the local-embedding pipeline — works without network. Only *new* LLM/embedding calls need the curator's configured endpoint. The sidebar shows an "Offline" pill when `navigator.onLine` is false.
 - **Mock mode** (`?mock=1`) for demos and screenshots — every call goes through a deterministic provider and the cache so the UI is fully exercised without network access or API keys.
 - **Themes** — four built-in themes (epublate, textual-dark, textual-light, high-contrast), pickable from the sidebar footer.
 
@@ -99,6 +100,7 @@ Then:
 3. The **Dashboard** opens. Click "Translate batch" to run the helper-LLM pre-pass, then translate every pending segment with bounded concurrency and a budget cap. Or open the **Reader**, focus a segment, and press `t` to translate just that one.
 4. **Glossary** picks up proposed entries from the helper LLM and from the translator's `new_entities` field on every successful call. Approve or lock the ones you care about.
 5. When you're happy, click **Download ePub** on the Dashboard for a translated file, or **Download bundle** for the full project archive.
+6. Open **Settings → Install for offline use** and click **Install epublate**. Your browser saves the app to your device so you can open it from your dock / home screen and use every screen offline — including cache-hit translations.
 
 <p align="center">
   <img src="docs/screenshots/02-new-project-modal.png" alt="The New project modal with petitprince.epub already loaded, source language fr, target language en, the Literary fiction preset selected with its prose contract preview, and the helper-LLM auto-intake checkbox enabled." width="100%" />
@@ -240,6 +242,8 @@ Bundles are forward-compatible: older clients refuse newer schemas with a clear 
 ## Browser realities
 
 - **CORS** — works against OpenAI, OpenRouter, Together, Groq, DeepInfra, and any other OpenAI-compatible service. Local **Ollama** requires `OLLAMA_ORIGINS=*` so the browser is allowed to call it.
+- **Ollama options** — when the base URL looks like Ollama (`:11434` / `ollama` host), Settings surfaces a dedicated card for `num_ctx`, `num_predict`, sampling, Mirostat, and a **Disable thinking** toggle (`think: false`, the documented Ollama switch for Gemma 3 / Qwen 3 / DeepSeek-R1 / GPT-OSS) with one-click presets. Cloud providers ignore the extra body fields, so the values stick around safely if you swap models. See [USAGE → Ollama options](docs/USAGE.md#ollama-options-optional-auto-detected).
+- **Reasoning models** — `reasoning_effort` accepts the standard `minimal` / `low` / `medium` / `high` ladder plus an Ollama-compat `none`, so you can suppress thinking on cloud o-series and Ollama alike from a single project config. See [USAGE → LLM endpoint](docs/USAGE.md#llm-endpoint).
 - **API keys** are stored in IndexedDB on this device only. They are never logged outside the LLM audit row, which itself stays local. The Settings screen has redact / clear actions.
 - **Storage** — a 100,000-word novel is roughly 1–5 MB of segments + a few MB of LLM audit. The Settings screen surfaces per-project size and a delete action.
 - **No filesystem** — ePubs come in via the dropzone or file picker; exports go out as browser downloads. There is no file watcher and no syncing — the Bundle export is your portable representation.

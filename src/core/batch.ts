@@ -33,6 +33,7 @@ import {
   type LoreRetrievalOptions,
   type TranslateOutcome,
 } from "@/core/pipeline";
+import { EmbeddingPrefetcher } from "@/core/embedding_prefetch";
 import { runPrePass, type IntakeOptions } from "@/core/extractor";
 import { listGlossaryEntries } from "@/db/repo/glossary";
 import { rowToSegment } from "@/db/repo/segments";
@@ -42,6 +43,7 @@ import {
   buildEmbeddingProvider,
   type ProjectEmbeddingOverrides,
 } from "@/llm/embeddings/factory";
+import { type EmbeddingProvider } from "@/llm/embeddings/base";
 import { resolveProjectGlossaryWithLore } from "@/lore/attach";
 import { nowMs } from "@/lib/time";
 import { type LLMProvider } from "@/llm/base";
@@ -50,7 +52,67 @@ import {
   SegmentStatus,
   type SegmentRow,
   type SegmentStatusT,
+  type BatchRetryConfig,
 } from "@/db/schema";
+
+/**
+ * Documented defaults for the batch-level retry / circuit-breaker.
+ * Distinct from the per-request provider retry (`DEFAULT_RETRY_POLICY`
+ * in `src/llm/openai_compat.ts`): these run *after* the provider has
+ * already exhausted its own retries and bubbled a failure for the
+ * segment. Values picked to be conservative on cloud (where transient
+ * errors are rare) yet forgiving on local Ollama (where a slow first
+ * generation routinely times out before the model is hot).
+ *
+ * Tuning suggestions:
+ *
+ * - Bump `max_retries_per_segment` (1 → 3) for flaky hosted endpoints.
+ * - Tighten `max_errors_in_window` for fast-fail behaviour during
+ *   capture / screenshot runs.
+ * - Loosen `error_window_size` (100 → 500) for very long books where
+ *   a brief outage shouldn't trip the breaker after only 10 segments.
+ */
+export const BATCH_RETRY_DEFAULTS: Required<BatchRetryConfig> = {
+  max_retries_per_segment: 2,
+  error_window_size: 100,
+  max_errors_in_window: 10,
+};
+
+/**
+ * Clamp a hand-edited (or undefined) `BatchRetryConfig` into a fully
+ * populated, sane shape. Any missing or out-of-range field falls back
+ * to `BATCH_RETRY_DEFAULTS`. Negative / non-finite numbers are
+ * treated as "use default", not "disable". Window size is forced to
+ * be at least the failure threshold so the breaker stays meaningful.
+ */
+export function resolveBatchRetryConfig(
+  raw: BatchRetryConfig | null | undefined,
+): Required<BatchRetryConfig> {
+  const r = raw ?? {};
+  const max_retries =
+    typeof r.max_retries_per_segment === "number" &&
+    Number.isFinite(r.max_retries_per_segment) &&
+    r.max_retries_per_segment >= 0
+      ? Math.trunc(r.max_retries_per_segment)
+      : BATCH_RETRY_DEFAULTS.max_retries_per_segment;
+  const window =
+    typeof r.error_window_size === "number" &&
+    Number.isFinite(r.error_window_size) &&
+    r.error_window_size > 0
+      ? Math.trunc(r.error_window_size)
+      : BATCH_RETRY_DEFAULTS.error_window_size;
+  const threshold =
+    typeof r.max_errors_in_window === "number" &&
+    Number.isFinite(r.max_errors_in_window) &&
+    r.max_errors_in_window > 0
+      ? Math.trunc(r.max_errors_in_window)
+      : BATCH_RETRY_DEFAULTS.max_errors_in_window;
+  return {
+    max_retries_per_segment: max_retries,
+    error_window_size: Math.max(window, threshold),
+    max_errors_in_window: threshold,
+  };
+}
 
 export interface BatchOptions {
   model: string;
@@ -64,14 +126,33 @@ export interface BatchOptions {
   bypass_cache?: boolean;
   /** Style guide override; falls back to project row. */
   style_guide?: string | null;
-  /** OpenAI o-series reasoning-effort knob. */
-  reasoning_effort?: "minimal" | "low" | "medium" | "high" | null;
+  /**
+   * Reasoning-effort knob. OpenAI o-series accepts
+   * `minimal | low | medium | high`; Ollama-compat extends with
+   * `none` to disable thinking on thinking-capable models.
+   */
+  reasoning_effort?: "minimal" | "low" | "medium" | "high" | "none" | null;
   /**
    * Helper-LLM pre-pass: when set, runs `runPrePass` once per chapter
    * just before its segments hit the translator, so the glossary picks
    * up new proposed entries early in the batch. Disabled by default.
    */
   pre_pass?: IntakeOptions | null;
+  /**
+   * Number of embedding `embed()` calls running in parallel with the
+   * translator pool. Each call already pulls `provider.batch_size`
+   * segments, so 4 concurrent calls embed `4 * batch_size` segments
+   * per network wave (≈ 256 for OpenAI's default of 64). Defaults to
+   * `4`. Set higher for local Ollama where there's no rate limit.
+   */
+  embedding_parallel_batches?: number;
+  /**
+   * Batch-level retry / circuit-breaker config. `null` /
+   * `undefined` ⇒ use `BATCH_RETRY_DEFAULTS`. Values are clamped on
+   * read by `resolveBatchRetryConfig`, so a hand-edited Dexie row
+   * can't disable the breaker by accident.
+   */
+  retry?: BatchRetryConfig | null;
 }
 
 export interface BatchSummary {
@@ -189,6 +270,15 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
   } = input;
 
   const concurrency = Math.max(1, options.concurrency ?? 1);
+  // Resolve the retry / circuit-breaker config once. Clamps every
+  // field against the sane defaults so a hand-edited Dexie row
+  // can't break the breaker.
+  const retry_cfg = resolveBatchRetryConfig(options.retry ?? null);
+  // Sliding-window outcome log: `true` ⇒ failure (after all per-
+  // segment retries exhausted), `false` ⇒ success. Workers push at
+  // the end and trim from the head so the array length stays
+  // bounded by `error_window_size`.
+  const outcome_window: boolean[] = [];
 
   const detail_db = openProjectDb(project_id);
   const detail = await detail_db.projects.get(project_id);
@@ -230,6 +320,7 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
   // provider is "none" / unavailable we keep the legacy v1 behaviour
   // of flattening every attached Lore Book into the prompt.
   let lore_retrieval: LoreRetrievalOptions | null = null;
+  let embedding_provider_for_pipeline: EmbeddingProvider | null = null;
   try {
     const library = await readLlmConfig();
     let project_emb_overrides: ProjectEmbeddingOverrides | null = null;
@@ -249,10 +340,12 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
     });
     if (built.provider) {
       lore_retrieval = { provider: built.provider };
+      embedding_provider_for_pipeline = built.provider;
     }
   } catch {
     // Embedding builder failures fall back to the legacy merge.
     lore_retrieval = null;
+    embedding_provider_for_pipeline = null;
   }
 
   // Glossary state: capture once at start. Reading it on each segment
@@ -347,6 +440,35 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
     }
   }
 
+  // Embedding prefetcher: when a provider is available, kick off a
+  // bulk warm-cache pass *in parallel* with the translator workers.
+  // The prefetcher reserves an in-flight promise per segment before
+  // it dispatches each batch, so workers that race ahead pick up the
+  // shared promise instead of firing redundant singleton embeds.
+  // When no provider is configured we skip the prefetcher entirely;
+  // the pipeline still works (`embedding_provider` stays null) and
+  // simply doesn't do retrieval.
+  const prefetcher = embedding_provider_for_pipeline
+    ? new EmbeddingPrefetcher(
+        project_id,
+        embedding_provider_for_pipeline,
+        signal,
+      )
+    : null;
+  const prefetch_promise = prefetcher
+    ? prefetcher
+        .warmCache(pending, {
+          parallel_batches: Math.max(
+            1,
+            options.embedding_parallel_batches ?? 4,
+          ),
+        })
+        .catch(() => {
+          // Warm-cache failures fall back to per-segment singleton
+          // embeds; the prefetcher already audits the failure event.
+        })
+    : Promise.resolve();
+
   // Sliding-window pool: fire `concurrency` workers; each pulls the
   // next segment off the cursor until the queue is empty, the budget
   // trips, or the curator cancels. Workers also handle their own
@@ -378,78 +500,167 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
         // Lifecycle callbacks must never sink the batch.
       }
       try {
-        const chapter_notes = await chapterNotesFor(seg.chapter_id);
-        const outcome = await translateSegment({
-          project_id,
-          source_lang,
-          target_lang,
-          style_guide: effective_style_guide,
-          chapter_notes,
-          segment: seg,
-          provider,
-          options: {
-            model: options.model,
-            bypass_cache: options.bypass_cache,
-            reasoning_effort: options.reasoning_effort ?? null,
-            glossary_state: glossary_state,
-            lore_retrieval,
-            // Phase 3: pass the same provider so `relevant` context
-            // mode works when the curator hasn't attached a Lore
-            // Book. The pipeline only embeds when a request actually
-            // needs the vector (lore-retrieval and/or relevant
-            // context), so this stays a no-op for `previous` /
-            // `dialogue` modes.
-            embedding_provider: lore_retrieval?.provider ?? null,
-            signal,
-          },
-        });
-        applyOutcome(summary, outcome);
-        const over_budget =
-          effective_budget !== null &&
-          effective_budget !== undefined &&
-          summary.cost_usd > effective_budget;
-        summary.elapsed_s = (performance.now() - started) / 1000;
-        on_progress?.({
-          segment_id: seg.id,
-          chapter_id: seg.chapter_id,
-          outcome,
-          error: null,
-          summary: cloneSummary(summary),
-        });
-        if (over_budget && !paused) {
-          paused = true;
-          pause_reason = `budget cap $${effective_budget!.toFixed(4)} reached at $${summary.cost_usd.toFixed(4)}`;
+        // Per-segment retry loop. Distinct from the provider's own
+        // retry policy: this layer fires only after the provider
+        // has already exhausted its retries and bubbled a failure
+        // for the whole segment (typically a timeout or persistent
+        // CORS / 5xx class). We retry the *entire* `translateSegment`
+        // call so the prompt rebuild, glossary merge, and audit-row
+        // write all happen fresh on each attempt — the same way a
+        // curator-initiated re-run would.
+        const max_retries = retry_cfg.max_retries_per_segment;
+        let final_error: string | null = null;
+        let succeeded = false;
+        let rate_limit_pause: LLMRateLimitError | null = null;
+        let was_cancelled = false;
+        for (let attempt = 0; attempt <= max_retries; attempt += 1) {
+          if (cancelled || paused) break;
+          if (signal?.aborted) {
+            was_cancelled = true;
+            break;
+          }
+          try {
+            const chapter_notes = await chapterNotesFor(seg.chapter_id);
+            const outcome = await translateSegment({
+              project_id,
+              source_lang,
+              target_lang,
+              style_guide: effective_style_guide,
+              chapter_notes,
+              segment: seg,
+              provider,
+              options: {
+                model: options.model,
+                bypass_cache: options.bypass_cache,
+                reasoning_effort: options.reasoning_effort ?? null,
+                glossary_state: glossary_state,
+                lore_retrieval,
+                // Phase 3: pass the same provider so `relevant`
+                // context mode works when the curator hasn't
+                // attached a Lore Book. The pipeline only embeds
+                // when a request actually needs the vector (lore-
+                // retrieval and/or relevant context), so this stays
+                // a no-op for `previous` / `dialogue` modes.
+                embedding_provider: embedding_provider_for_pipeline,
+                // Workers ask the prefetcher first; if the segment's
+                // batch is in flight they join its promise,
+                // otherwise they hit the IDB cache or fall back to
+                // a singleton embed (also registered so peer
+                // workers piggyback).
+                embedding_prefetcher: prefetcher,
+                signal,
+              },
+            });
+            applyOutcome(summary, outcome);
+            const over_budget =
+              effective_budget !== null &&
+              effective_budget !== undefined &&
+              summary.cost_usd > effective_budget;
+            summary.elapsed_s = (performance.now() - started) / 1000;
+            on_progress?.({
+              segment_id: seg.id,
+              chapter_id: seg.chapter_id,
+              outcome,
+              error: null,
+              summary: cloneSummary(summary),
+            });
+            if (over_budget && !paused) {
+              paused = true;
+              pause_reason = `budget cap $${effective_budget!.toFixed(4)} reached at $${summary.cost_usd.toFixed(4)}`;
+            }
+            succeeded = true;
+            break;
+          } catch (exc: unknown) {
+            if (exc instanceof LLMRateLimitError) {
+              // Rate limits abort the *batch*, not the segment —
+              // the segment stays pending so the next run picks it
+              // up.
+              rate_limit_pause = exc;
+              break;
+            }
+            if (signal?.aborted) {
+              was_cancelled = true;
+              break;
+            }
+            const msg = exc instanceof Error ? exc.message : String(exc);
+            final_error = msg;
+            // Audit each retry separately so the activity log shows
+            // the actual pattern (timeout → timeout → success vs
+            // timeout → 500 → 500 — the latter is a real outage).
+            await appendEvent(project_id, "batch.segment_retry", {
+              segment_id: seg_row.id,
+              chapter_id: seg_row.chapter_id,
+              attempt,
+              max_retries,
+              error: msg,
+              will_retry: attempt < max_retries,
+            });
+            if (attempt >= max_retries) break;
+            // No exponential backoff at this layer — the provider
+            // already backs off internally and a long second-level
+            // sleep would just bloat the wall-clock with no real
+            // chance of changing the outcome. The breaker handles
+            // "too many failures in a row" instead.
+          }
         }
-      } catch (exc: unknown) {
-        if (exc instanceof LLMRateLimitError) {
+        if (rate_limit_pause) {
           if (!paused) {
             paused = true;
-            pause_reason = formatRateLimitPause(exc);
+            pause_reason = formatRateLimitPause(rate_limit_pause);
           }
-          // Don't fail the segment on a rate-limit; it stays pending
-          // for the next run. The `finally` block fires on_segment_end.
+          // Don't count rate-limited segments against the breaker —
+          // they're a controlled pause, not a failure pattern.
           return;
         }
-        if (signal?.aborted) {
+        if (was_cancelled) {
           cancelled = true;
           return;
         }
-        const msg = exc instanceof Error ? exc.message : String(exc);
-        summary.failed += 1;
-        summary.failures.push({ segment_id: seg_row.id, error: msg });
-        await appendEvent(project_id, "batch.segment_failed", {
-          segment_id: seg_row.id,
-          chapter_id: seg_row.chapter_id,
-          error: msg,
-        });
-        summary.elapsed_s = (performance.now() - started) / 1000;
-        on_progress?.({
-          segment_id: seg_row.id,
-          chapter_id: seg_row.chapter_id,
-          outcome: null,
-          error: msg,
-          summary: cloneSummary(summary),
-        });
+        if (succeeded) {
+          // Sliding-window record on success too — a successful
+          // segment that follows a string of failures should clear
+          // the breaker counter as the window slides forward.
+          recordOutcome(false);
+        } else {
+          // All retries exhausted — record the segment failure
+          // exactly once and check the circuit breaker before
+          // letting the next segment start.
+          const msg =
+            final_error ?? "translation failed (no error captured)";
+          summary.failed += 1;
+          summary.failures.push({ segment_id: seg_row.id, error: msg });
+          await appendEvent(project_id, "batch.segment_failed", {
+            segment_id: seg_row.id,
+            chapter_id: seg_row.chapter_id,
+            error: msg,
+            attempts_used: max_retries + 1,
+          });
+          summary.elapsed_s = (performance.now() - started) / 1000;
+          on_progress?.({
+            segment_id: seg_row.id,
+            chapter_id: seg_row.chapter_id,
+            outcome: null,
+            error: msg,
+            summary: cloneSummary(summary),
+          });
+          recordOutcome(true);
+          if (!paused && shouldTripCircuitBreaker()) {
+            paused = true;
+            const fail_count = outcome_window.filter(Boolean).length;
+            pause_reason =
+              `circuit breaker tripped: ${fail_count} of the last ` +
+              `${outcome_window.length} segments failed (threshold ` +
+              `${retry_cfg.max_errors_in_window} of ` +
+              `${retry_cfg.error_window_size}). Fix the underlying ` +
+              `error and resume the batch.`;
+            await appendEvent(project_id, "batch.circuit_breaker", {
+              window_size: outcome_window.length,
+              failures_in_window: fail_count,
+              threshold: retry_cfg.max_errors_in_window,
+              window_capacity: retry_cfg.error_window_size,
+            });
+          }
+        }
       } finally {
         try {
           on_segment_end?.({
@@ -457,10 +668,26 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
             chapter_id: seg.chapter_id,
           });
         } catch {
-          /* swallow */
+          // Lifecycle callbacks must never sink the batch.
         }
       }
     }
+  }
+
+  function recordOutcome(failed: boolean): void {
+    outcome_window.push(failed);
+    while (outcome_window.length > retry_cfg.error_window_size) {
+      outcome_window.shift();
+    }
+  }
+
+  function shouldTripCircuitBreaker(): boolean {
+    if (outcome_window.length < retry_cfg.max_errors_in_window) return false;
+    let fails = 0;
+    for (const x of outcome_window) {
+      if (x) fails += 1;
+    }
+    return fails >= retry_cfg.max_errors_in_window;
   }
 
   await Promise.all(
@@ -468,6 +695,17 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
       worker(),
     ),
   );
+
+  // Make sure any straggler embedding batches finish (and write
+  // their audit rows) before we mark the run complete. The workers
+  // may have finished translation while a final embedding batch is
+  // still in flight; awaiting it here keeps the audit log clean and
+  // the IDB cache populated for the next run.
+  try {
+    await prefetch_promise;
+  } catch {
+    /* prefetcher already audited its own failures */
+  }
 
   summary.elapsed_s = (performance.now() - started) / 1000;
 

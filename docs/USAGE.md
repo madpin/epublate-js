@@ -71,9 +71,33 @@ The sidebar's **Library** section (Projects, Lore Books) stays visible everywher
 
 ## Configuring an LLM endpoint
 
+Open **Settings** from the sidebar footer.
+
+### Install for offline use
+
+![Settings → Install card showing the install state pill, "App cached for offline use" pill, online status, and the Install epublate button](screenshots/17-install-pwa.png)
+
+The first card on the Settings screen lets you save the app to this device. Click **Install epublate** and your browser will offer a confirm dialog; afterwards epublate appears in your dock / Applications / Home Screen and opens in its own window without browser chrome.
+
+Three pills tell you the status:
+
+- **Available to install** / **Installed** / **Running as installed app** / **Browser-managed install** — the install state. The button disables in any state other than "Available to install".
+- **App cached for offline use** — flips on the first time Workbox finishes precaching the shell. Until then the badge says "Caching app for offline use…" — no action required, refresh the page to confirm.
+- **Online** / **Offline** — `navigator.onLine` snapshot. Editing, browsing, and cache-hit translations work in either state; new LLM/embedding calls need the online state.
+
+If the install button stays disabled and the install pill says "Browser-managed install", your browser hasn't fired the PWA install event for this page (Safari desktop and Firefox desktop don't support it by default). You can still install via:
+
+- **Chrome / Edge / Brave** — the install icon at the right edge of the address bar, or the three-dot menu → "Install epublate".
+- **Firefox** — install the "PWAs for Firefox" extension.
+- **Safari (iOS / iPadOS)** — Share → "Add to Home Screen".
+
+The first time the service worker activates a sonner toast says "epublate is saved on this device" so you know the offline shell is ready. Subsequent builds trigger a "A new version of epublate is available — Reload now" toast on activation.
+
+### LLM endpoint
+
 ![Settings → LLM with a base URL, key, and the green "Connection OK" pill after a successful test](screenshots/12-settings-llm.png)
 
-Open **Settings** from the sidebar footer. The LLM tab has four important fields:
+The LLM card has four important fields:
 
 | Field             | Purpose                                                                                              |
 | ----------------- | ---------------------------------------------------------------------------------------------------- |
@@ -90,6 +114,30 @@ Click **Test connection** before kicking off any work. The button performs a 1-t
 - ⚠️ "404 model not found" — pick a different model the endpoint actually exposes.
 
 If you don't have an LLM yet, append `?mock=1` to any URL or toggle **Mock LLM mode** in Settings. The mock provider returns deterministic placeholders so the entire UI works without network access.
+
+The card also exposes two reliability knobs that mostly matter for slow models:
+
+- **Request timeout** — how long a single chat-completion call is allowed to run before the in-flight `fetch` is aborted. Defaults to **120 s**, which is generous for cloud providers but tight for local Ollama on a CPU-only laptop running a 14 B+ thinking model. Bump this to 300–600 s if you see the new error message _"timed out after Xs while talking to … — increase Request timeout in Settings → LLM, or disable thinking on the model"_. Empty / `0` falls back to the 120 s default.
+- **Reasoning effort** — pass-through to OpenAI o-series and any compatible endpoint. `minimal` / `low` / `medium` / `high` follow the official spec; **`none`** is an Ollama-compat extension that asks the endpoint to skip the thinking phase entirely (e.g. `qwen3:14b` honours it via the OpenAI-shaped `/v1/chat/completions` translator). Cloud providers that don't recognise `none` ignore the field. To turn thinking off on Ollama specifically, prefer the `think: false` switch in the Ollama options card below — it's the native, model-agnostic toggle.
+
+### Ollama options (optional, auto-detected)
+
+![Settings → Ollama options card showing num_ctx, num_predict, temperature, and repeat_penalty inputs alongside the Translation 8K / Long context / Deterministic / Creative preset chips](screenshots/12c-ollama-options-card.png)
+
+The **Ollama options** card sits right under the LLM endpoint and forwards Ollama-specific knobs (`num_ctx`, `num_predict`, sampling, Mirostat) on every chat request. Cloud providers ignore the extra body field, so leaving values set here doesn't break a mid-project swap to OpenAI / OpenRouter / Together.
+
+When epublate detects an Ollama-shaped base URL (`:11434` or `ollama` in the host), the card opens automatically. Otherwise it folds into a muted "Show anyway" state — these knobs only matter for Ollama, and the form would be a distraction on a cloud config.
+
+The card is structured for the two most common workflows:
+
+- **Quick presets.** One click loads `Translation (8K context)` (recommended for most curators), `Long context (16K)` (for chapter-sized batches when your model + GPU fit it), `Deterministic` (temperature 0 + fixed seed; ideal for screenshotting or reproducing a glossary regression), or `Creative` (looser sampling for tone experiments).
+- **Field-by-field tweaks.** Each input has an inline help icon with prose explaining what the knob does, the Ollama default, and the value epublate suggests. The four common-tier fields are visible by default; sampling (`top_k`, `top_p`, `seed`) and Mirostat hide behind a "Show advanced options" toggle.
+
+The single biggest lever is `num_ctx`. Ollama's default is 2048 tokens, which is small enough that a chapter-sized prompt is silently truncated — bump this to 8192 or 16384 if your model can hold it. Memory cost roughly doubles with the window; if Ollama OOMs, drop back to 4096.
+
+The card also exposes the **Disable thinking** tri-state (rendered as `Use model default` / `Enable` / `Disable`). Setting it to **Disable** sends `think: false` as a top-level field on the chat-completion body, which is Ollama's documented way to skip reasoning on Gemma 3 / Qwen 3 / DeepSeek-R1 / GPT-OSS and other thinking-capable models. The translation presets (Translation 8K, Long context, Deterministic) ship with `think: false` because reasoning rarely helps on a translation prompt and roughly halves wall-clock time. Set it back to `Use model default` if you ever want to compare side-by-side.
+
+Two non-destructive escape hatches: **Reset** rewinds the form to the last saved state, and **Clear all** drops every override (so Ollama uses its built-in defaults). Neither writes anything until you click **Save**.
 
 ### Embeddings (optional, off by default)
 
@@ -122,6 +170,19 @@ epublate doesn't pretend this isn't happening:
 - **Per-project inventory card.** Project Settings now renders an **Embedding inventory** card with a histogram of `(scope, model)` rows: segments, project glossary, every attached Lore Book. Active rows light up green; rows under non-active models are flagged grey/struck-through as "stale".
 - **Re-embed everything.** A one-click action that re-runs the intake-style embedding pass plus the project glossary embed under the active provider's model. Lore Books are opt-in via a checkbox because their vectors are shared across every project that has them attached.
 - **Purge stale rows.** A second action that drops every project-DB row whose `model` differs from the active one. Useful once the curator is sure they won't switch back; a future re-embed re-creates them at the cost of fresh provider calls.
+
+### Batch reliability (retry + circuit breaker)
+
+![Settings → Batch reliability card with three numeric inputs: Max retries per segment (default 2), Recent-segment window (default 100), Failures before pause (default 10)](screenshots/12d-batch-reliability-card.png)
+
+A flaky local model or a half-open Ollama tunnel used to drag a whole batch into the Inbox one segment at a time. The **Batch reliability** card exposes a two-tier resilience layer that catches both:
+
+- **Per-segment retry budget.** When `translateSegment` throws a transient error (`network error talking to …`, AbortError-as-timeout, JSON parse glitches), the runner retries the same segment up to **N more times** (default `2`) before recording a failure. Provider-level retries (rate-limit backoff, `Retry-After`) still happen first; this is the second line of defence above them. Cache hits, locked-glossary rejections, and validator errors are *not* retried — they are deterministic and would just burn the budget.
+- **Sliding-window circuit breaker.** The runner keeps a rolling outcome ring of the last **W segments** (default `100`). If the failure count inside the window crosses **threshold T** (default `10`), the batch is paused with `pause_reason = "circuit breaker tripped: 12/100 segments failed in the recent window"` and the status bar offers a Resume action once you've fixed the underlying problem. Successful segments age out of the window naturally, so a brief network blip doesn't trip the breaker.
+
+The defaults are calibrated for cloud LLMs ("retry the obvious; pause after 10 % sustained failure"). For local Ollama on a CPU-only host you may want to bump `Max retries per segment` to `4` and lower the window to `50` so you notice trouble earlier. Setting `Max retries` to `0` disables segment retries entirely (matching pre-resilience behaviour). Click **Restore defaults** to put every field back to the recommended values without losing other Settings changes.
+
+Every segment retry writes a `batch.segment_retry` event and every breaker trip writes a `batch.circuit_breaker` event to the audit ledger, so you can reconstruct exactly when the runner intervened from the LLM activity screen.
 
 ---
 
@@ -504,11 +565,19 @@ Every edit writes a `segment.edited` event to the audit log; nothing is irrevers
 
 ## FAQ
 
-**Does it work offline?** After the first load, yes. The PWA service worker caches the app shell. Translations need network unless you're in mock mode.
+**Does it work offline?** Yes — after the first load. The Workbox service worker precaches the SPA shell, and Settings → Install lets you save the app to your dock or home screen so you can launch it without a browser tab. Once the shell is cached you can:
+
+- Browse every screen (Projects, Reader, Glossary, Inbox, LLM activity, Logs, Settings).
+- Edit translations, glossary entries, lore books, and project settings (writes go to IndexedDB immediately).
+- Download the translated ePub or the project bundle.
+- Re-run a batch on a populated cache — every cached translation replays from the audit ledger with zero network.
+- Use the local embedding pipeline if you opted in (the model weights are cached in the browser's Cache Storage after the first download).
+
+What still needs network: making *new* LLM calls (anything that wasn't already in the cache) and pulling fresh embeddings from a remote provider. The sidebar shows a yellow "Offline" pill when `navigator.onLine` is false so you know which calls will fail.
 
 **Can I run the LLM call against my own self-hosted model?** Yes — anything OpenAI-compatible. We've tested OpenAI, OpenRouter, Together, Groq, DeepInfra, and Ollama (with `OLLAMA_ORIGINS=*`).
 
-**Do you support reasoning models?** Yes. Project Settings → LLM overrides has a `reasoning_effort` knob (`minimal` / `low` / `medium` / `high`); it's only honoured by OpenAI o-series and compatible models, ignored elsewhere.
+**Do you support reasoning models?** Yes — and you can also turn reasoning off, which is usually what a translation pipeline wants. Settings → LLM and Project Settings → LLM overrides expose a `reasoning_effort` knob with the standard `minimal` / `low` / `medium` / `high` values plus an Ollama-compat **`none`** option for endpoints that recognise it. To turn thinking off on local Ollama specifically, prefer the **Disable thinking** tri-state in the Ollama options card — it sends `think: false` as a top-level body field, which is the model-agnostic toggle Ollama documents for Gemma 3 / Qwen 3 / DeepSeek-R1 / GPT-OSS. Cloud providers ignore the unknown field, so a single project config works regardless of which endpoint is active.
 
 **Can I export the glossary?** Yes — the Glossary screen has JSON / CSV import / export buttons. The bundled JSON includes aliases and revisions; the CSV is one row per `(entry, alias_side, alias_text)`.
 

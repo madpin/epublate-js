@@ -113,6 +113,14 @@ export const DEFAULT_LLM_CONFIG: LibraryLlmConfigRow = {
   reasoning_effort: null,
   pricing_overrides: {},
   embedding: DEFAULT_EMBEDDING_CONFIG,
+  ollama_options: null,
+  // 60 s is the OpenAI / fast-cloud default — fine for hosted models,
+  // routinely too short for a local Ollama with a thinking-capable
+  // model on a chapter-sized prompt. Keep it null here so existing
+  // rows fall back to the provider default; new curators get a more
+  // generous 180 s pre-filled in the Settings card.
+  timeout_ms: null,
+  batch_retry: null,
 };
 
 /**

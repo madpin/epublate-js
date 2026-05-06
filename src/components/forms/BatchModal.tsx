@@ -161,7 +161,11 @@ export function BatchModal({
   }, [chapters_with_counts, selection]);
 
   const onStart = async (): Promise<void> => {
-    const parsed_conc = Math.max(1, Math.min(8, Number(concurrency) || 1));
+    // No upper cap: local providers (Ollama, on-device Xenova) and
+    // larger plan tiers can comfortably saturate dozens of in-flight
+    // calls. The provider's retry/backoff still protects against
+    // accidentally over-driving a small endpoint.
+    const parsed_conc = Math.max(1, Number(concurrency) || 1);
     const parsed_budget = budget.trim() === "" ? null : Number(budget);
     const budget_usd =
       parsed_budget !== null && Number.isFinite(parsed_budget)
@@ -349,13 +353,14 @@ export function BatchModal({
               id="b-concurrency"
               type="number"
               min={1}
-              max={8}
               value={concurrency}
               onChange={(e) => setConcurrency(e.target.value)}
             />
             <p className="mt-1 text-xs text-muted-foreground">
-              Parallel LLM calls. Default 1; raise only if the endpoint
-              tolerates it.
+              Parallel LLM calls. Local providers (Ollama, on-device)
+              can handle dozens; hosted endpoints typically tolerate
+              4–16. Embeddings always run in parallel batches alongside
+              the translator pool.
             </p>
           </div>
           <div>

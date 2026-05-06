@@ -15,7 +15,7 @@
 import * as React from "react";
 import { toast } from "sonner";
 
-import { libraryDb } from "@/db/library";
+import { libraryDb, readLlmConfig } from "@/db/library";
 import { openProjectDb } from "@/db/dexie";
 import {
   BatchCancelled,
@@ -144,6 +144,13 @@ export function useRunBatch(): {
 
       const glossary_state = await listGlossaryEntries(input.project_id);
 
+      // Pull the batch retry / circuit-breaker config off the
+      // library singleton — the runner clamps undefined fields
+      // against `BATCH_RETRY_DEFAULTS`, so a missing block here is
+      // safe.
+      const lib_llm = await readLlmConfig().catch(() => null);
+      const batch_retry = lib_llm?.batch_retry ?? null;
+
       const controller = new AbortController();
       const initial = createSummary();
       start_store({
@@ -167,6 +174,7 @@ export function useRunBatch(): {
             bypass_cache: input.bypass_cache ?? false,
             chapter_ids: input.chapter_ids ?? null,
             reasoning_effort,
+            retry: batch_retry,
             pre_pass: input.pre_pass
               ? {
                   model: helper_model,

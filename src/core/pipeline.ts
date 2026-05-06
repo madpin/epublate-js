@@ -23,6 +23,7 @@ import { newId } from "@/lib/id";
 import { autoProposeFromTranslatorTrace } from "@/core/auto_propose";
 import { cacheKeyForMessages, EMPTY_GLOSSARY_HASH } from "@/core/cache";
 import { type ContextMode, isDialogueSegment } from "@/core/dialogue";
+import { type EmbeddingPrefetcher } from "@/core/embedding_prefetch";
 import {
   findLlmCallByCacheKey,
   insertLlmCall,
@@ -193,11 +194,20 @@ export interface TranslateOptions {
    * pipeline falls back to `previous` mode for any `relevant` request.
    */
   embedding_provider?: EmbeddingProvider | null;
+  /**
+   * Optional shared {@link EmbeddingPrefetcher}. When set, the
+   * pipeline routes its single per-segment vector lookup through the
+   * prefetcher so it can join a bulk batch already in flight. Created
+   * by the batch runner once per run; ignored when not provided. This
+   * is the path that turns "5 000 single-segment embed calls" into
+   * "≈ 78 batched calls running in parallel with translator workers".
+   */
+  embedding_prefetcher?: EmbeddingPrefetcher | null;
   /** Phase 4: proposed-entry hint retrieval. */
   proposed_hints?: ProposedHintsRetrievalOptions | null;
   bypass_cache?: boolean;
   response_format?: ResponseFormat | null;
-  reasoning_effort?: "minimal" | "low" | "medium" | "high" | null;
+  reasoning_effort?: "minimal" | "low" | "medium" | "high" | "none" | null;
   context?: ContextOptions;
   signal?: AbortSignal;
 }
@@ -277,13 +287,25 @@ export async function translateSegment(
   const active_emb_provider =
     options.lore_retrieval?.provider ?? options.embedding_provider ?? null;
   if (active_emb_provider) {
-    const result = await embedAndPersistSegment({
-      project_id,
-      segment,
-      provider: active_emb_provider,
-      signal: options.signal,
-    });
-    segment_vec_cache = result.segment_vec;
+    if (options.embedding_prefetcher) {
+      // Hot path: piggyback on a bulk batch the prefetcher
+      // dispatched alongside the translator pool. Hits the in-
+      // memory promise map first, the IDB cache second, and only
+      // falls back to a single-segment embed if the worker raced
+      // ahead of the prefetcher entirely.
+      segment_vec_cache =
+        await options.embedding_prefetcher.getEmbedding(segment);
+    } else {
+      // Test / single-shot path: keep the legacy per-segment embed
+      // so unit tests don't have to construct a prefetcher.
+      const result = await embedAndPersistSegment({
+        project_id,
+        segment,
+        provider: active_emb_provider,
+        signal: options.signal,
+      });
+      segment_vec_cache = result.segment_vec;
+    }
     embedding_model_used = active_emb_provider.model;
   }
   if (options.lore_retrieval && segment_vec_cache) {
@@ -419,8 +441,13 @@ export async function translateSegment(
       prompt_tokens: result.usage?.prompt_tokens ?? 0,
       completion_tokens: result.usage?.completion_tokens ?? 0,
       request_json,
-      response_json: stableStringify({ content: result.content, raw: result.raw }),
+      response_json: stableStringify({
+        content: result.content,
+        raw: result.raw,
+        duration_ms: result.duration_ms ?? null,
+      }),
       cache_key,
+      duration_ms: result.duration_ms ?? null,
     });
     throw err;
   }
@@ -451,6 +478,7 @@ export async function translateSegment(
     trace,
     raw: result.raw,
     violations,
+    duration_ms: result.duration_ms ?? null,
   });
   const created_at = Date.now();
 
@@ -479,6 +507,7 @@ export async function translateSegment(
         request_json,
         response_json,
         created_at,
+        duration_ms: result.duration_ms ?? null,
       });
       await db.events.add({
         project_id,
@@ -644,6 +673,9 @@ async function replayFromCache(input: ReplayInput): Promise<TranslateOutcome> {
         request_json,
         response_json,
         created_at,
+        // null (not 0) so the LLM Activity screen renders "cache
+        // replay" instead of suggesting the call took 0 ms.
+        duration_ms: null,
       });
       await db.events.add({
         project_id,
@@ -1121,6 +1153,7 @@ interface FailedCallInput {
   request_json: string;
   response_json: string;
   cache_key: string;
+  duration_ms?: number | null;
 }
 
 async function persistFailedCall(input: FailedCallInput): Promise<void> {
@@ -1137,6 +1170,7 @@ async function persistFailedCall(input: FailedCallInput): Promise<void> {
     cache_key: input.cache_key,
     request_json: input.request_json,
     response_json: input.response_json,
+    duration_ms: input.duration_ms ?? null,
   });
 }
 
@@ -1239,9 +1273,14 @@ async function embedAndPersistSegment(
       project_id,
       segment_id: segment.id,
       model: provider.model,
+      provider_name: provider.name,
       vector: v,
       prompt_tokens,
       cost_usd: estimateCost(provider.model, prompt_tokens, 0),
+      duration_ms: result.duration_ms ?? null,
+      reported_model: result.model,
+      raw: result.raw,
+      usage: result.usage,
     });
     return { segment_vec: v };
   } catch (err) {
@@ -1271,9 +1310,14 @@ interface PersistSegmentEmbeddingInput {
   project_id: string;
   segment_id: string;
   model: string;
+  provider_name: string;
   vector: Float32Array;
   prompt_tokens: number;
   cost_usd: number;
+  duration_ms: number | null;
+  reported_model: string;
+  raw: unknown;
+  usage: { prompt_tokens: number } | null;
 }
 
 async function persistSegmentEmbedding(
@@ -1300,11 +1344,22 @@ async function persistSegmentEmbedding(
       cache_hit: false,
       cache_key: null,
       request_json: stableStringify({
+        provider: input.provider_name,
+        model: input.model,
         scope: "segment",
+        kind: "singleton",
         segment_id: input.segment_id,
       }),
-      response_json: stableStringify({ dim: input.vector.length }),
+      response_json: stableStringify({
+        vectors: 1,
+        dim: input.vector.length,
+        model: input.reported_model,
+        usage: input.usage,
+        duration_ms: input.duration_ms,
+        raw: input.raw,
+      }),
       created_at: Date.now(),
+      duration_ms: input.duration_ms,
     });
   } catch {
     // Persistence failures here are non-fatal; the next translateSegment

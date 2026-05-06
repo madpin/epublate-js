@@ -49,6 +49,13 @@ export const DEFAULT_RETRY_POLICY: RetryPolicy = {
   jitter: true,
 };
 
+function nowMillis(): number {
+  if (typeof performance !== "undefined" && performance.now) {
+    return performance.now();
+  }
+  return Date.now();
+}
+
 function delayFor(policy: RetryPolicy, attempt: number): number {
   if (attempt <= 0) return 0;
   const base = Math.min(
@@ -166,8 +173,10 @@ export class OpenAICompatEmbeddingProvider implements EmbeddingProvider {
         model: this.model,
         usage: { prompt_tokens: 0 },
         raw: { object: "list", data: [] },
+        duration_ms: 0,
       };
     }
+    const t0 = nowMillis();
     const out: Float32Array[] = new Array(texts.length);
     let prompt_tokens = 0;
     let last_raw: unknown = null;
@@ -187,6 +196,7 @@ export class OpenAICompatEmbeddingProvider implements EmbeddingProvider {
       model: last_model,
       usage: { prompt_tokens },
       raw: last_raw,
+      duration_ms: nowMillis() - t0,
     };
   }
 

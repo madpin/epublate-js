@@ -251,6 +251,15 @@ export interface LlmCallRow {
   request_json: string | null;
   response_json: string | null;
   created_at: number;
+  /**
+   * Wall-clock duration of the provider call, in milliseconds. `null`
+   * for cache-hit replays (no network round-trip happened) and for
+   * legacy rows written before the column was introduced. Surfaced in
+   * the LLM Activity screen so curators can spot slow models / large
+   * embedding batches at a glance. Non-indexed — Dexie ignores it for
+   * legacy reads, which return `undefined`.
+   */
+  duration_ms?: number | null;
 }
 
 export interface EmbeddingRow {
@@ -444,7 +453,25 @@ export interface LibraryLlmConfigRow {
   model: string;
   helper_model: string | null;
   organization: string | null;
-  reasoning_effort: "minimal" | "low" | "medium" | "high" | null;
+  /**
+   * `reasoning_effort` controls thinking/chain-of-thought intensity
+   * on capable models. Five recognized values:
+   *
+   * - `"minimal" | "low" | "medium" | "high"` — OpenAI o-series
+   *   convention; cloud models ignore unrecognized values.
+   * - `"none"` — Ollama-compat extension that *disables* thinking on
+   *   thinking-capable models (Qwen 3, DeepSeek-R1, Gemma 3 thinking,
+   *   GPT-OSS reasoning). See
+   *   https://github.com/ollama/ollama/issues/14820. Cloud providers
+   *   that don't recognise `"none"` silently fall back to their
+   *   default, so it's safe to leave on across a model swap.
+   * - `null` — provider default (no `reasoning_effort` field sent).
+   *
+   * Note: thinking-capable models often add latency proportional to
+   * the effort level. Translation work usually doesn't benefit from
+   * `medium`/`high`; `low` or `none` is the sweet spot.
+   */
+  reasoning_effort: "minimal" | "low" | "medium" | "high" | "none" | null;
   /**
    * Curator-defined pricing overrides keyed by model slug, in USD per
    * million tokens. Layered on top of the package defaults at boot
@@ -462,6 +489,100 @@ export interface LibraryLlmConfigRow {
    * missing this field implicitly behave as if `provider = "none"`.
    */
   embedding?: LibraryEmbeddingConfig;
+  /**
+   * Optional Ollama-specific runtime options forwarded as a top-level
+   * `options` object on every chat-completion request. Cloud
+   * providers ignore the unknown body field; Ollama maps the values
+   * onto its native Modelfile knobs (`num_ctx`, `num_predict`,
+   * `temperature`, etc.). See `src/llm/ollama.ts` for the full list,
+   * defaults, and the Settings → Ollama options card. `null` /
+   * missing means "send no overrides", which is the default for
+   * pre-existing rows.
+   *
+   * Stored as the runtime `OllamaOptions` shape (every value optional
+   * + numeric) so the field round-trips without a structural cast.
+   * `sanitizeOllamaOptions` re-clamps on read/write so a hand-edited
+   * Dexie row never reaches the wire with garbage.
+   */
+  ollama_options?: OllamaOptionsLike | null;
+  /**
+   * Per-request timeout (milliseconds). When a single chat-completion
+   * call exceeds this, the provider aborts the in-flight `fetch`,
+   * surfaces a typed timeout error, and the retry policy decides
+   * whether to try again. Pre-existing rows fall back to the
+   * provider's default (60 s, see `OpenAICompatProvider.timeout_ms`)
+   * — but local Ollama with a thinking-capable model on a chapter-
+   * sized prompt comfortably exceeds that, so the Settings card
+   * defaults new rows to a more generous 180 s.
+   */
+  timeout_ms?: number | null;
+  /**
+   * Batch-level reliability knobs. Distinct from the per-request
+   * provider retry (which handles transient HTTP 5xx / 429 / network
+   * blips inside a single chat call): once a segment exhausts the
+   * provider retries and bubbles a failure, the *batch* layer
+   * decides whether to (a) retry the segment again from scratch and
+   * (b) trip a circuit breaker if too many segments fail in a row.
+   *
+   * Pre-existing rows are missing this field; the batch runner falls
+   * back to the documented defaults (see `BATCH_RETRY_DEFAULTS` in
+   * `src/core/batch.ts`).
+   */
+  batch_retry?: BatchRetryConfig | null;
+}
+
+/**
+ * Batch-runner retry / circuit-breaker config. All fields optional;
+ * `runBatch` clamps and falls back to `BATCH_RETRY_DEFAULTS` for any
+ * missing or invalid value. Lives in the persistence layer (rather
+ * than `core/batch.ts`) so a hand-edited Dexie row round-trips
+ * cleanly across the type system.
+ */
+export interface BatchRetryConfig {
+  /**
+   * Extra retry attempts at the batch level *after* the provider's
+   * own retry policy has given up on a segment. `0` disables batch
+   * retries entirely (only the provider retries inside a single
+   * call). `2` (the default) gives each segment 1 normal try + 2
+   * full retries before recording a failure.
+   */
+  max_retries_per_segment?: number;
+  /**
+   * Sliding window size (number of most-recent settled segments) the
+   * circuit breaker watches. Must be at least 1. The breaker
+   * compares failures *within this window* against
+   * `max_errors_in_window`.
+   */
+  error_window_size?: number;
+  /**
+   * Failure threshold inside the sliding window. When the count of
+   * failed segments in the last `error_window_size` settled segments
+   * exceeds this, the batch pauses with a `BatchPaused` error and
+   * the curator can fix the root cause (CORS, model unloaded,
+   * timeout too tight) before resuming.
+   */
+  max_errors_in_window?: number;
+}
+
+/**
+ * Persisted shape for Ollama runtime options. Mirrors `OllamaOptions`
+ * in `src/llm/ollama.ts` but lives here so `db/schema.ts` doesn't
+ * depend on `@/llm/*` (preserves the persistence-layer's "no
+ * behaviour imports" rule). Mixed-type field — most values are
+ * numbers (Modelfile knobs); `think` is a top-level boolean.
+ */
+export interface OllamaOptionsLike {
+  num_ctx?: number;
+  num_predict?: number;
+  temperature?: number;
+  top_k?: number;
+  top_p?: number;
+  repeat_penalty?: number;
+  seed?: number;
+  mirostat?: number;
+  mirostat_eta?: number;
+  mirostat_tau?: number;
+  think?: boolean;
 }
 
 /**

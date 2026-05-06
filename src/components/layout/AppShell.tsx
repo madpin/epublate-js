@@ -39,6 +39,7 @@ import { useLiveQuery } from "dexie-react-hooks";
 import {
   ArrowLeft,
   BookOpen,
+  CloudDownload,
   Database,
   FlaskConical,
   Home,
@@ -49,6 +50,7 @@ import {
   Settings as SettingsIcon,
   Sparkles,
   SquareLibrary,
+  WifiOff,
 } from "lucide-react";
 
 import { BatchStatusBar } from "./BatchStatusBar";
@@ -59,6 +61,13 @@ import { useAppStore } from "@/state/app";
 import { useLastProjectStore } from "@/state/last_project";
 import { cn } from "@/lib/utils";
 import { Toaster } from "@/components/ui/sonner";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useOnlineStatus } from "@/hooks/useOnlineStatus";
+import { usePwaInstall } from "@/hooks/usePwaInstall";
 
 interface NavItem {
   /** Path suffix (no leading `/project/:id` — that gets prepended for project items). */
@@ -204,6 +213,7 @@ export function AppShell(): React.JSX.Element {
           <div className="mt-3 px-2 text-[11px] leading-snug text-muted-foreground">
             All data lives in your browser. Nothing is uploaded.
           </div>
+          <SidebarOfflineRow />
           {mock_mode ? (
             <div className="mt-2 rounded-md bg-warning/15 px-2 py-1 text-[11px] font-semibold text-warning">
               Mock LLM mode — no network calls.
@@ -296,4 +306,70 @@ function SidebarLink({
 
 function Separator(): React.JSX.Element {
   return <div className="my-1 h-px bg-border" aria-hidden="true" />;
+}
+
+/**
+ * Sidebar-footer row that surfaces the two "is the app saved here?"
+ * cues:
+ *
+ *   - **Install button** — visible only when the browser has handed
+ *     us a deferred `beforeinstallprompt` event and we're not already
+ *     running inside the installed PWA. Clicking triggers the native
+ *     install prompt; the button hides as soon as the prompt resolves.
+ *   - **Offline badge** — visible only when `navigator.onLine` is
+ *     false. Clarifies what still works (browse, edit, cache-hit
+ *     translations) and what doesn't (new LLM/embedding calls) so
+ *     curators don't blame the app for a sudden fetch failure.
+ *
+ * When neither applies (the common case: online, already installed
+ * or the browser doesn't fire `beforeinstallprompt`) the row is a
+ * no-op and renders nothing, so the existing footer layout is
+ * preserved.
+ */
+function SidebarOfflineRow(): React.JSX.Element | null {
+  const online = useOnlineStatus();
+  const install = usePwaInstall();
+
+  const show_install =
+    install.can_install && !install.installed && !install.running_as_installed_app;
+  const show_offline = !online;
+
+  if (!show_install && !show_offline) return null;
+
+  return (
+    <div className="mt-2 flex flex-col gap-1.5">
+      {show_install ? (
+        <button
+          type="button"
+          onClick={() => {
+            void install.prompt();
+          }}
+          className="flex items-center gap-2 rounded-md border border-primary/30 bg-primary/10 px-2 py-1.5 text-left text-[11px] font-medium text-primary transition-colors hover:bg-primary/15"
+          title="Save this app to your device so you can open it from your dock or home screen, and use it offline."
+        >
+          <CloudDownload className="size-3.5 shrink-0" />
+          <span className="truncate">Install epublate</span>
+        </button>
+      ) : null}
+      {show_offline ? (
+        <Tooltip delayDuration={150}>
+          <TooltipTrigger asChild>
+            <div
+              className="flex items-center gap-2 rounded-md bg-warning/15 px-2 py-1 text-[11px] font-semibold text-warning"
+              role="status"
+              aria-live="polite"
+            >
+              <WifiOff className="size-3.5 shrink-0" />
+              <span className="truncate">Offline</span>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="right" className="max-w-xs">
+            You're offline. Browsing, editing, and cache-hit
+            translations still work. New LLM and embedding calls
+            will fail until you reconnect.
+          </TooltipContent>
+        </Tooltip>
+      ) : null}
+    </div>
+  );
 }

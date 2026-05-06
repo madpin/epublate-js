@@ -5,7 +5,12 @@ import { createProject, deleteProject } from "@/db/repo/projects";
 import { listChapters } from "@/db/repo/chapters";
 import { openProjectDb } from "@/db/dexie";
 import { runProjectIntake } from "@/core/project_intake";
-import { runBatch, BatchPaused } from "@/core/batch";
+import {
+  runBatch,
+  BatchPaused,
+  resolveBatchRetryConfig,
+  BATCH_RETRY_DEFAULTS,
+} from "@/core/batch";
 import { MockProvider } from "@/llm/mock";
 
 const CONTAINER_XML = `<?xml version="1.0"?>
@@ -61,6 +66,56 @@ async function makeTestEpub(): Promise<ArrayBuffer> {
   new Uint8Array(buf).set(u8);
   return buf;
 }
+
+describe("resolveBatchRetryConfig", () => {
+  it("falls back to BATCH_RETRY_DEFAULTS when nothing is set", () => {
+    expect(resolveBatchRetryConfig(null)).toEqual(BATCH_RETRY_DEFAULTS);
+    expect(resolveBatchRetryConfig(undefined)).toEqual(BATCH_RETRY_DEFAULTS);
+    expect(resolveBatchRetryConfig({})).toEqual(BATCH_RETRY_DEFAULTS);
+  });
+
+  it("clamps malformed numeric fields to defaults", () => {
+    const r = resolveBatchRetryConfig({
+      max_retries_per_segment: -1,
+      error_window_size: 0,
+      max_errors_in_window: NaN,
+    });
+    expect(r).toEqual(BATCH_RETRY_DEFAULTS);
+  });
+
+  it("forces window size to be at least the threshold", () => {
+    const r = resolveBatchRetryConfig({
+      error_window_size: 5,
+      max_errors_in_window: 50,
+    });
+    expect(r.error_window_size).toBe(50);
+    expect(r.max_errors_in_window).toBe(50);
+  });
+
+  it("preserves legitimate overrides", () => {
+    const r = resolveBatchRetryConfig({
+      max_retries_per_segment: 5,
+      error_window_size: 200,
+      max_errors_in_window: 25,
+    });
+    expect(r).toEqual({
+      max_retries_per_segment: 5,
+      error_window_size: 200,
+      max_errors_in_window: 25,
+    });
+  });
+
+  it("truncates fractional integer fields", () => {
+    const r = resolveBatchRetryConfig({
+      max_retries_per_segment: 3.7,
+      error_window_size: 100.4,
+      max_errors_in_window: 10.9,
+    });
+    expect(r.max_retries_per_segment).toBe(3);
+    expect(r.error_window_size).toBe(100);
+    expect(r.max_errors_in_window).toBe(10);
+  });
+});
 
 describe("runBatch", () => {
   let projectId: string | null = null;
@@ -199,7 +254,15 @@ describe("runBatch", () => {
       source_lang: "en",
       target_lang: "pt",
       provider,
-      options: { model: "mock-model", concurrency: 1 },
+      // Disable the batch-level retry layer so the failure isolation
+      // assertion is testing what it says — a single failing segment
+      // doesn't sink the run. The retry layer has its own dedicated
+      // tests below.
+      options: {
+        model: "mock-model",
+        concurrency: 1,
+        retry: { max_retries_per_segment: 0 },
+      },
     });
 
     expect(summary.failed).toBe(1);
@@ -255,6 +318,179 @@ describe("runBatch", () => {
       expect(events[i + 1].kind).toBe("end");
       expect(events[i].segment_id).toBe(events[i + 1].segment_id);
     }
+  });
+
+  it("retries a failing segment up to max_retries_per_segment then records a failure", async () => {
+    const bytes = await makeTestEpub();
+    const project = await createProject({
+      name: "Retry",
+      source_lang: "en",
+      target_lang: "pt",
+      source_filename: "r.epub",
+      source_bytes: bytes,
+    });
+    projectId = project.id;
+    await runProjectIntake({
+      project_id: project.id,
+      source_lang: project.source_lang,
+      target_lang: project.target_lang,
+      epub_bytes: bytes,
+      source_filename: "r.epub",
+    });
+
+    // Fail one specific segment on every retry so we exhaust the
+    // retry budget and produce a single failure record. Other
+    // segments succeed on the first try. We identify "the same
+    // segment again" by content fingerprint — retries reuse the
+    // exact same user prompt, which is a robust proxy for segment
+    // identity without coupling the test to the prompt template.
+    const provider = new MockProvider();
+    let target_fingerprint: string | null = null;
+    const target_calls: number[] = [];
+    let call_count = 0;
+    vi.spyOn(provider, "chat").mockImplementation(async (input) => {
+      call_count += 1;
+      const fp = JSON.stringify(input.messages);
+      if (target_fingerprint === null) target_fingerprint = fp;
+      if (fp === target_fingerprint) {
+        target_calls.push(call_count);
+        throw new Error(`network error talking to http://localhost: simulated`);
+      }
+      const real = new MockProvider();
+      return real.chat(input);
+    });
+
+    const summary = await runBatch({
+      project_id: project.id,
+      source_lang: "en",
+      target_lang: "pt",
+      provider,
+      options: {
+        model: "mock-model",
+        concurrency: 1,
+        retry: { max_retries_per_segment: 2 },
+      },
+    });
+
+    // Exactly one segment failed (after 1 normal try + 2 retries = 3 attempts).
+    expect(summary.failed).toBe(1);
+    expect(target_calls.length).toBe(3);
+
+    // The audit log should show one `batch.segment_retry` per attempt
+    // plus one terminal `batch.segment_failed`.
+    const db = openProjectDb(project.id);
+    const events = await db.events.toArray();
+    const retries = events.filter((e) => e.kind === "batch.segment_retry");
+    const failed = events.filter((e) => e.kind === "batch.segment_failed");
+    expect(retries.length).toBe(3);
+    expect(failed.length).toBe(1);
+  });
+
+  it("succeeds when an early retry attempt fixes a transient failure", async () => {
+    const bytes = await makeTestEpub();
+    const project = await createProject({
+      name: "Retry-Success",
+      source_lang: "en",
+      target_lang: "pt",
+      source_filename: "rs.epub",
+      source_bytes: bytes,
+    });
+    projectId = project.id;
+    await runProjectIntake({
+      project_id: project.id,
+      source_lang: project.source_lang,
+      target_lang: project.target_lang,
+      epub_bytes: bytes,
+      source_filename: "rs.epub",
+    });
+
+    // First call fails, second succeeds. With max_retries=1 the
+    // retry layer should rescue the segment.
+    const provider = new MockProvider();
+    let calls = 0;
+    vi.spyOn(provider, "chat").mockImplementation(async (input) => {
+      calls += 1;
+      if (calls === 1) {
+        throw new Error("transient network blip");
+      }
+      const real = new MockProvider();
+      return real.chat(input);
+    });
+
+    const summary = await runBatch({
+      project_id: project.id,
+      source_lang: "en",
+      target_lang: "pt",
+      provider,
+      options: {
+        model: "mock-model",
+        concurrency: 1,
+        retry: { max_retries_per_segment: 1 },
+      },
+    });
+
+    expect(summary.failed).toBe(0);
+    expect(summary.translated).toBeGreaterThanOrEqual(1);
+  });
+
+  it("trips the circuit breaker when failures exceed the window threshold", async () => {
+    const bytes = await makeTestEpub();
+    const project = await createProject({
+      name: "Breaker",
+      source_lang: "en",
+      target_lang: "pt",
+      source_filename: "b.epub",
+      source_bytes: bytes,
+    });
+    projectId = project.id;
+    await runProjectIntake({
+      project_id: project.id,
+      source_lang: project.source_lang,
+      target_lang: project.target_lang,
+      epub_bytes: bytes,
+      source_filename: "b.epub",
+    });
+
+    // Fail every call to guarantee we hit the threshold quickly.
+    const provider = new MockProvider();
+    vi.spyOn(provider, "chat").mockImplementation(async () => {
+      throw new Error("everything is broken");
+    });
+
+    let threw: BatchPaused | null = null;
+    try {
+      await runBatch({
+        project_id: project.id,
+        source_lang: "en",
+        target_lang: "pt",
+        provider,
+        options: {
+          model: "mock-model",
+          concurrency: 1,
+          retry: {
+            max_retries_per_segment: 0,
+            error_window_size: 2,
+            max_errors_in_window: 2,
+          },
+        },
+      });
+    } catch (err: unknown) {
+      if (err instanceof BatchPaused) threw = err;
+      else throw err;
+    }
+
+    expect(threw).not.toBeNull();
+    expect(threw!.summary.paused_reason).toMatch(/circuit breaker tripped/);
+    // We tripped at the threshold (2 failures), so the run did not
+    // attempt every segment in the project.
+    expect(threw!.summary.failed).toBeGreaterThanOrEqual(2);
+
+    const db = openProjectDb(project.id);
+    const events = await db.events.toArray();
+    const breaker_evt = events.filter(
+      (e) => e.kind === "batch.circuit_breaker",
+    );
+    expect(breaker_evt.length).toBeGreaterThanOrEqual(1);
   });
 
   it("filters by chapter_ids", async () => {

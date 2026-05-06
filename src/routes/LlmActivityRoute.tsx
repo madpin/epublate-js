@@ -54,6 +54,9 @@ export function LlmActivityRoute(): React.JSX.Element {
     let completion = 0;
     let hits = 0;
     let misses = 0;
+    let duration_ms_total = 0;
+    let duration_samples = 0;
+    let duration_ms_max = 0;
     const purposes = new Map<string, number>();
     for (const r of rows) {
       cost += r.cost_usd ?? 0;
@@ -62,8 +65,26 @@ export function LlmActivityRoute(): React.JSX.Element {
       if (r.cache_hit) hits += 1;
       else misses += 1;
       purposes.set(r.purpose, (purposes.get(r.purpose) ?? 0) + 1);
+      // duration_ms is non-indexed; legacy rows return undefined.
+      // Only count rows that actually report a measured duration so
+      // averages don't get diluted by cache replays / older calls.
+      if (typeof r.duration_ms === "number" && r.duration_ms >= 0) {
+        duration_ms_total += r.duration_ms;
+        duration_samples += 1;
+        if (r.duration_ms > duration_ms_max) duration_ms_max = r.duration_ms;
+      }
     }
-    return { cost, prompt, completion, hits, misses, purposes };
+    return {
+      cost,
+      prompt,
+      completion,
+      hits,
+      misses,
+      purposes,
+      duration_ms_total,
+      duration_samples,
+      duration_ms_max,
+    };
   }, [rows]);
 
   const selected = React.useMemo(() => {
@@ -93,7 +114,7 @@ export function LlmActivityRoute(): React.JSX.Element {
         </p>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-6">
         <SummaryCard label="Calls" value={rows ? String(rows.length) : "—"} />
         <SummaryCard
           label="Cache hits"
@@ -114,6 +135,23 @@ export function LlmActivityRoute(): React.JSX.Element {
         <SummaryCard
           label="Completion tok."
           value={totals ? formatTokens(totals.completion) : "—"}
+        />
+        <SummaryCard
+          label="Avg / max latency"
+          value={
+            totals && totals.duration_samples > 0
+              ? `${formatDuration(
+                  totals.duration_ms_total / totals.duration_samples,
+                )} / ${formatDuration(totals.duration_ms_max)}`
+              : "—"
+          }
+          title={
+            totals && totals.duration_samples > 0
+              ? `Across ${totals.duration_samples} measured call${
+                  totals.duration_samples === 1 ? "" : "s"
+                }; cache hits / legacy rows excluded.`
+              : undefined
+          }
         />
         <SummaryCard
           label="Total cost"
@@ -183,7 +221,7 @@ export function LlmActivityRoute(): React.JSX.Element {
                           {formatStamp(r.created_at)}
                         </span>
                       </div>
-                      <div className="grid grid-cols-3 gap-2 text-xs text-muted-foreground">
+                      <div className="grid grid-cols-4 gap-2 text-xs text-muted-foreground">
                         <span className="truncate">{r.model}</span>
                         <span
                           className="font-mono"
@@ -197,6 +235,25 @@ export function LlmActivityRoute(): React.JSX.Element {
                           {formatTokens(r.prompt_tokens)}{" "}
                           <span className="text-foreground/70">out</span>{" "}
                           {formatTokens(r.completion_tokens)}
+                        </span>
+                        <span
+                          className={cn(
+                            "font-mono",
+                            typeof r.duration_ms === "number"
+                              ? ""
+                              : "opacity-50",
+                          )}
+                          title={
+                            typeof r.duration_ms === "number"
+                              ? `Wall-clock duration of the provider call (${r.duration_ms} ms)`
+                              : "No wall-clock duration recorded — cache hit, legacy row, or non-instrumented provider."
+                          }
+                        >
+                          {typeof r.duration_ms === "number"
+                            ? formatDuration(r.duration_ms)
+                            : r.cache_hit
+                              ? "cache"
+                              : "—"}
                         </span>
                         <span className="font-mono">
                           {formatCost(r.cost_usd)}
@@ -234,18 +291,37 @@ export function LlmActivityRoute(): React.JSX.Element {
 function SummaryCard({
   label,
   value,
+  title,
 }: {
   label: string;
   value: string;
+  title?: string;
 }): React.JSX.Element {
   return (
-    <div className="rounded-lg border bg-card px-3 py-2">
+    <div className="rounded-lg border bg-card px-3 py-2" title={title}>
       <div className="text-xs uppercase tracking-wide text-muted-foreground">
         {label}
       </div>
       <div className="text-base font-semibold">{value}</div>
     </div>
   );
+}
+
+/**
+ * Compact wall-clock duration formatter. Mirrors how `gh run view`
+ * surfaces job times — sub-second runs get ms precision, longer ones
+ * round to the most significant unit so the column stays readable in
+ * the recent-calls list.
+ */
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "—";
+  if (ms < 1) return "<1 ms";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(s < 10 ? 2 : 1)} s`;
+  const m = Math.floor(s / 60);
+  const rem_s = Math.round(s - m * 60);
+  return `${m}m ${rem_s.toString().padStart(2, "0")}s`;
 }
 
 function PurposeBadge({ purpose }: { purpose: string }): React.JSX.Element {
@@ -290,6 +366,17 @@ function CallDetail({ row }: { row: LlmCallRow }): React.JSX.Element {
         />
         <KV label="Total tokens" value={formatTokens(total_tok)} mono />
         <KV label="Cost" value={formatCost(row.cost_usd)} mono />
+        <KV
+          label="Duration"
+          value={
+            typeof row.duration_ms === "number"
+              ? `${formatDuration(row.duration_ms)} (${row.duration_ms} ms)`
+              : row.cache_hit
+                ? "cache replay (no round-trip)"
+                : "not measured"
+          }
+          mono
+        />
         <KV label="Cache hit" value={row.cache_hit ? "yes" : "no"} />
         <KV
           label="Cache key"
@@ -300,24 +387,37 @@ function CallDetail({ row }: { row: LlmCallRow }): React.JSX.Element {
         <KV label="Segment ID" value={row.segment_id ?? "—"} mono truncate />
       </div>
       <div>
-        <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-          Request
+        <div className="mb-1 flex items-center justify-between text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+          <span>Request</span>
+          <span className="font-mono normal-case opacity-70">
+            {row.request_json
+              ? `${row.request_json.length.toLocaleString()} chars`
+              : ""}
+          </span>
         </div>
         {/* `whitespace-pre-wrap` keeps the formatted JSON readable
             while letting long lines wrap inside the pane; `break-words`
             handles tokens (URLs, base64) that have no whitespace.
             `overflow-y-auto` (not `overflow-auto`) means we never get
             a horizontal scrollbar, which the curator can't reach
-            without resizing the divider. */}
-        <pre className="max-h-72 overflow-y-auto whitespace-pre-wrap break-words rounded border bg-muted/40 p-2 font-mono text-[11px] leading-snug">
+            without resizing the divider. The cap is generous so the
+            full embedding raw payload (≈ 1 536 floats per vector × N
+            vectors) renders without truncation; if it's still long
+            the inner pre scrolls. */}
+        <pre className="max-h-[40vh] overflow-y-auto whitespace-pre-wrap break-words rounded border bg-muted/40 p-2 font-mono text-[11px] leading-snug">
           {request}
         </pre>
       </div>
       <div>
-        <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-          Response
+        <div className="mb-1 flex items-center justify-between text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+          <span>Response</span>
+          <span className="font-mono normal-case opacity-70">
+            {row.response_json
+              ? `${row.response_json.length.toLocaleString()} chars`
+              : ""}
+          </span>
         </div>
-        <pre className="max-h-72 overflow-y-auto whitespace-pre-wrap break-words rounded border bg-muted/40 p-2 font-mono text-[11px] leading-snug">
+        <pre className="max-h-[60vh] overflow-y-auto whitespace-pre-wrap break-words rounded border bg-muted/40 p-2 font-mono text-[11px] leading-snug">
           {response}
         </pre>
       </div>

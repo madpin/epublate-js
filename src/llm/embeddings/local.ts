@@ -207,8 +207,13 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         model: this.model,
         usage: { prompt_tokens: 0 },
         raw: { local: true, model: this.model, count: 0 },
+        duration_ms: 0,
       };
     }
+    const t0 =
+      typeof performance !== "undefined" && performance.now
+        ? performance.now()
+        : Date.now();
     const embedder = await this.embedder();
     const out: Float32Array[] = new Array(texts.length);
     let total_chars = 0;
@@ -245,11 +250,16 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         total_chars += batch[j]!.length;
       }
     }
+    const duration_ms =
+      (typeof performance !== "undefined" && performance.now
+        ? performance.now()
+        : Date.now()) - t0;
     return {
       vectors: out,
       model: this.model,
       usage: { prompt_tokens: Math.max(0, Math.ceil(total_chars / 4)) },
       raw: { local: true, model: this.model, count: texts.length },
+      duration_ms,
     };
   }
 

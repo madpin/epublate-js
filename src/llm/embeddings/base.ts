@@ -40,6 +40,12 @@ export interface EmbeddingResult {
   usage: EmbeddingUsage | null;
   /** Raw response payload for the audit log. */
   raw: unknown;
+  /**
+   * Wall-clock duration of the call (including any internal batching /
+   * retries), in milliseconds. `null` when the provider didn't measure.
+   * Used by the LLM Activity screen to surface slow embedding calls.
+   */
+  duration_ms?: number | null;
 }
 
 export interface EmbeddingProvider {

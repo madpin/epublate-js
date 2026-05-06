@@ -31,7 +31,11 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { FieldHelp } from "@/components/ui/field-help";
+import { BatchReliabilityCard } from "@/components/settings/BatchReliabilityCard";
 import { EmbeddingsCard } from "@/components/settings/EmbeddingsCard";
+import { InstallCard } from "@/components/settings/InstallCard";
+import { OllamaOptionsCard } from "@/components/settings/OllamaOptionsCard";
 
 /**
  * Settings screen.
@@ -54,8 +58,11 @@ export function SettingsRoute(): React.JSX.Element {
   const [model, setModel] = React.useState(llm.model);
   const [helper_model, setHelperModel] = React.useState(llm.helper_model ?? "");
   const [reasoning_effort, setReasoningEffort] = React.useState<
-    "" | "minimal" | "low" | "medium" | "high"
+    "" | "minimal" | "low" | "medium" | "high" | "none"
   >(llm.reasoning_effort ?? "");
+  const [timeout_ms, setTimeoutMs] = React.useState<string>(
+    llm.timeout_ms != null ? String(llm.timeout_ms) : "",
+  );
   const [show_key, setShowKey] = React.useState(false);
 
   const [budget_default, setBudgetDefault] = React.useState(
@@ -71,6 +78,7 @@ export function SettingsRoute(): React.JSX.Element {
     setModel(llm.model);
     setHelperModel(llm.helper_model ?? "");
     setReasoningEffort(llm.reasoning_effort ?? "");
+    setTimeoutMs(llm.timeout_ms != null ? String(llm.timeout_ms) : "");
   }, [llm]);
 
   React.useEffect(() => {
@@ -90,12 +98,20 @@ export function SettingsRoute(): React.JSX.Element {
     // before the request ever leaves the page.
     const trimmed_key = api_key.trim();
     setApiKey(trimmed_key);
+    // Parse timeout: blank -> null (use provider default), positive
+    // integer in ms -> stored as-is, anything else -> null with a
+    // toast warning so curators don't silently lose a typo.
+    const parsed_timeout = parseTimeoutMs(timeout_ms);
+    if (parsed_timeout.warning) {
+      toast.warning(parsed_timeout.warning);
+    }
     await setLlmConfig({
       base_url: base_url.trim(),
       api_key: trimmed_key,
       model: model.trim(),
       helper_model: helper_model.trim() || null,
       reasoning_effort: reasoning_effort === "" ? null : reasoning_effort,
+      timeout_ms: parsed_timeout.value,
     });
     toast.success("LLM config saved.");
   };
@@ -149,10 +165,11 @@ export function SettingsRoute(): React.JSX.Element {
   const saveDefaults = async (): Promise<void> => {
     const budget_n =
       budget_default.trim() === "" ? null : Number(budget_default);
-    const conc_n = Math.max(
-      1,
-      Math.min(8, Number(concurrency_default) || 4),
-    );
+    // No upper cap: local providers (Ollama, on-device Xenova) and
+    // larger plan tiers can saturate dozens of in-flight calls. The
+    // provider's retry/backoff still protects against accidentally
+    // over-driving a small endpoint.
+    const conc_n = Math.max(1, Number(concurrency_default) || 4);
     await setUiPref(
       "default_budget_usd",
       budget_n !== null && Number.isFinite(budget_n) ? budget_n : null,
@@ -172,6 +189,8 @@ export function SettingsRoute(): React.JSX.Element {
       </header>
 
       <div className="flex-1 space-y-6 overflow-y-auto px-6 py-6">
+        <InstallCard />
+
         <Card>
           <CardHeader>
             <CardTitle>LLM endpoint</CardTitle>
@@ -232,10 +251,37 @@ export function SettingsRoute(): React.JSX.Element {
                 />
               </div>
             </div>
-            <div className="grid gap-2">
-              <Label htmlFor="reasoning_effort">
-                Reasoning effort (OpenAI o-series; ignored elsewhere)
-              </Label>
+            <div className="grid gap-1.5">
+              <FieldHelp
+                htmlFor="reasoning_effort"
+                label="Reasoning effort"
+                help={
+                  <>
+                    <p>
+                      Controls thinking / chain-of-thought depth on
+                      capable models. Translation rarely benefits from{" "}
+                      <code>medium</code> / <code>high</code>;{" "}
+                      <code>low</code> or <code>none</code> is the
+                      sweet spot.
+                    </p>
+                    <p className="mt-2">
+                      <strong>none</strong> is the Ollama-compat
+                      extension that <em>disables</em> thinking on
+                      Qwen 3, DeepSeek-R1, Gemma 3 thinking, and
+                      GPT-OSS reasoning models — major latency win.
+                      Cloud providers that don't recognise it fall
+                      back to their default, so it's safe to leave
+                      on across a model swap.
+                    </p>
+                    <p className="mt-2">
+                      <strong>minimal / low / medium / high</strong>{" "}
+                      is the OpenAI o-series convention; permissive
+                      endpoints silently ignore values they don't
+                      know.
+                    </p>
+                  </>
+                }
+              />
               <select
                 id="reasoning_effort"
                 value={reasoning_effort}
@@ -246,17 +292,61 @@ export function SettingsRoute(): React.JSX.Element {
                       | "minimal"
                       | "low"
                       | "medium"
-                      | "high",
+                      | "high"
+                      | "none",
                   )
                 }
                 className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 <option value="">(provider default)</option>
-                <option value="minimal">minimal</option>
+                <option value="none">none — disable thinking (Ollama / Qwen 3 / DeepSeek-R1)</option>
+                <option value="minimal">minimal — OpenAI o-series</option>
                 <option value="low">low</option>
                 <option value="medium">medium</option>
                 <option value="high">high</option>
               </select>
+            </div>
+            <div className="grid gap-1.5">
+              <FieldHelp
+                htmlFor="timeout_ms"
+                label="Request timeout (ms)"
+                help={
+                  <>
+                    <p>
+                      Per-request HTTP timeout. When a single chat
+                      call takes longer than this, epublate aborts the
+                      <code className="mx-1">fetch</code>, surfaces a
+                      typed timeout error, and the retry policy
+                      decides whether to try again.
+                    </p>
+                    <p className="mt-2">
+                      <strong>Defaults.</strong> Leave blank to use
+                      the built-in <code>60000</code> (60 s). Cloud
+                      models almost always finish well inside that
+                      window. Local Ollama with a thinking-capable
+                      model on a chapter-sized prompt routinely
+                      doesn't — bump to <code>180000</code> (3 min)
+                      or higher, and see Ollama options → Disable
+                      thinking for the structural fix.
+                    </p>
+                    <p className="mt-2">
+                      Hard cap: 24 h, so a typo can't pin a worker
+                      forever.
+                    </p>
+                  </>
+                }
+              />
+              <Input
+                id="timeout_ms"
+                type="number"
+                inputMode="numeric"
+                min={1000}
+                step={1000}
+                placeholder="60000"
+                value={timeout_ms}
+                onChange={(e) => setTimeoutMs(e.target.value)}
+                className="font-mono text-xs"
+              />
             </div>
             <div className="flex flex-wrap justify-end gap-2">
               <Button
@@ -277,6 +367,10 @@ export function SettingsRoute(): React.JSX.Element {
             </div>
           </CardContent>
         </Card>
+
+        <OllamaOptionsCard />
+
+        <BatchReliabilityCard />
 
         <EmbeddingsCard />
 
@@ -315,13 +409,14 @@ export function SettingsRoute(): React.JSX.Element {
                   id="concurrency_default"
                   type="number"
                   min={1}
-                  max={8}
                   value={concurrency_default}
                   onChange={(e) => setConcurrencyDefault(e.target.value)}
                 />
                 <p className="text-xs text-muted-foreground">
-                  Parallel translator calls. Most public endpoints
-                  tolerate 4; OpenRouter/Together cope with more.
+                  Parallel translator calls. Local providers (Ollama,
+                  on-device) handle dozens; OpenRouter/Together usually
+                  cope with 8–16. Embeddings always run in their own
+                  parallel batch pool — they don't share this slot.
                 </p>
               </div>
             </div>
@@ -600,6 +695,34 @@ function PricingCard(): React.JSX.Element {
       </CardContent>
     </Card>
   );
+}
+
+/**
+ * Parse the raw "request timeout" textbox into a positive millisecond
+ * count, surfacing a warning when the curator typed something we
+ * can't use (so we don't silently fall back to the default 60 s).
+ *
+ * - Empty / whitespace ⇒ unset (provider default).
+ * - Positive integer ⇒ accepted.
+ * - 0 / negative / non-numeric ⇒ unset + warning.
+ */
+function parseTimeoutMs(
+  raw: string,
+): { value: number | null; warning: string | null } {
+  const t = raw.trim();
+  if (t === "") return { value: null, warning: null };
+  const n = Number(t);
+  if (!Number.isFinite(n) || n <= 0) {
+    return {
+      value: null,
+      warning: `Request timeout must be a positive number of milliseconds; got "${t}". Cleared.`,
+    };
+  }
+  // Cap at 24 h — a runaway timeout from a typo (3600000000) would
+  // pin a worker for weeks. The cap is generous enough for any real
+  // local-Ollama scenario.
+  const capped = Math.min(Math.round(n), 24 * 60 * 60 * 1000);
+  return { value: capped, warning: null };
 }
 
 function ToggleRow({

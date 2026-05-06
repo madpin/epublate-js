@@ -16,7 +16,7 @@ The script:
 1. Resets every IndexedDB DB the SPA owns (clean slate every run).
 2. Creates a project from `tests/fixtures/petitprince.epub` via the New Project modal, with `auto_intake = true` and `tone_sniff = false` for deterministic helper-LLM behaviour.
 3. Walks the project-level screens by SPA navigation (preserving Dexie context across hops):
-   - Projects empty → New Project modal → Dashboard → Translate batch → Dashboard (translated) → Reader (Chapitre III, prose-rich) → Glossary → Inbox → Project Settings (default + **Relevant context mode**) → Lore Books → Settings → LLM (default + **Embeddings card**) → Intake runs → LLM activity → Cheat sheet → Theme picker → Projects populated → Hero (Dashboard).
+   - Projects empty → New Project modal → Dashboard → Translate batch → Dashboard (translated) → Reader (Chapitre III, prose-rich) → Glossary → Inbox → Project Settings (default + **Relevant context mode**) → Lore Books → Settings → LLM (default + **Embeddings card** + **Install card**) → Intake runs → LLM activity → Cheat sheet → Theme picker → Projects populated → Hero (Dashboard).
 4. Saves PNGs into this folder using the contract filenames listed below.
 
 The capture runs at viewport `1024 × 640` against the default `epublate` theme. To re-capture in a different theme, set `THEME` in the script (`epublate`, `textual-dark`, `textual-light`, `epublate-contrast`).
@@ -42,11 +42,14 @@ The capture runs at viewport `1024 × 640` against the default `epublate` theme.
 |    | `09b-relevant-context-mode.png`       | Project Settings    | Context-window card with the **Relevant** mode selected and the cosine-similarity sub-controls visible. |
 | 12 | `10-lore-books.png`                   | Lore Books          | Empty Lore Books library with the New Lore Book + Import bundle CTAs.                             |
 | 13 | `12-settings-llm.png`                 | Settings → LLM      | LLM endpoint card with base URL + key + translator/helper model fields, plus Defaults and Pricing.|
+|    | `12c-ollama-options-card.png`         | Settings → Ollama options | Ollama-specific knobs (`num_ctx`, `num_predict`, sampling, Mirostat, **Disable thinking**) revealed via "Show anyway" because the mock base URL is OpenAI. Shows the four common-tier inputs + preset chips. |
 |    | `12b-embeddings-card.png`             | Settings → Embeddings| Embeddings card scrolled into view — provider picker (none / openai-compat / local), model, dim, batch size, and consent state. |
+|    | `12d-batch-reliability-card.png`      | Settings → Batch reliability | Per-segment retry budget + sliding-window circuit breaker (`Max retries per segment`, `Recent-segment window`, `Failures before pause`) with the Restore-defaults button. |
 | 14 | `13-intake-runs.png`                  | Intake runs         | List of helper-LLM intake runs for the seeded project.                                            |
 | 15 | `14-llm-activity.png`                 | LLM activity        | Per-call audit ledger: 100 calls, cost, prompt/completion tokens, recent-call list.               |
 | 16 | `15-cheat-sheet.png`                  | Cheat sheet         | Keyboard-shortcut dialog (`?` / `F1`).                                                            |
 | 17 | `16-themes.png`                       | Theme picker        | Sidebar-footer theme dropdown open with all four themes listed.                                   |
+| 18 | `17-install-pwa.png`                  | Settings → Install  | Install card scrolled into view: install-state pill, "App cached for offline use" pill, online/offline pill, and the **Install epublate** button. Headless Chromium doesn't fire `beforeinstallprompt`, so the deterministic state is "Browser-managed install" with the explanatory hint visible. |
 
 The capture script does *not* exercise the per-chapter Translate Chapter modal (`05b`) or the Lore Book dashboard (`11`) yet; both are described in prose in `docs/USAGE.md` until we wire them up.
 

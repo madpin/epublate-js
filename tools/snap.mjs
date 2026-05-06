@@ -356,7 +356,48 @@ async function captureSettingsLlm(page) {
   log("== Settings → LLM ==");
   await gotoMock(page, "/settings");
   await page.waitForTimeout(500);
+
+  // The Install card now sits at the top of the Settings page. Scroll
+  // the LLM card into view before snapping so the same screenshot
+  // contract still shows the LLM endpoint card centered.
+  const llmHeading = page
+    .getByRole("heading", { name: /^LLM endpoint$/ })
+    .first();
+  if ((await llmHeading.count()) > 0) {
+    await llmHeading.scrollIntoViewIfNeeded().catch(() => {});
+    await page.waitForTimeout(200);
+  }
   await snap(page, "12-settings-llm");
+
+  // 12c — Ollama options card. The card auto-detects an Ollama URL
+  // and only renders the form when the base URL looks local; the
+  // mock-mode default base URL is the OpenAI cloud, so we click
+  // "Show anyway" to expose the form for the documentation shot.
+  // Falls back gracefully if the card is missing (older builds).
+  log("== Settings → Ollama options ==");
+  const ollamaHeading = page
+    .getByRole("heading", { name: /^Ollama options$/ })
+    .first();
+  if ((await ollamaHeading.count()) > 0) {
+    try {
+      await ollamaHeading.scrollIntoViewIfNeeded();
+      await page.waitForTimeout(200);
+      const showAnyway = page
+        .getByRole("button", { name: /Show anyway/i })
+        .first();
+      if ((await showAnyway.count()) > 0) {
+        await showAnyway.click().catch(() => {});
+        await page.waitForTimeout(200);
+      }
+      await ollamaHeading.scrollIntoViewIfNeeded().catch(() => {});
+      await page.waitForTimeout(200);
+      await snap(page, "12c-ollama-options-card");
+    } catch (err) {
+      log("  could not capture ollama options card:", err.message);
+    }
+  } else {
+    log("  ollama options heading not found, skipping 12c");
+  }
 
   // 12b — Embeddings card (introduced in the embeddings retrieval
   // layer). Scrolls the page so the card title is centered, then
@@ -375,6 +416,49 @@ async function captureSettingsLlm(page) {
     }
   } else {
     log("  embeddings heading not found, skipping 12b");
+  }
+
+  // 12d — Batch reliability card (per-segment retry budget +
+  // sliding-window circuit breaker). Sits below the Embeddings card
+  // in /settings; scrolls into view so the three numeric inputs and
+  // the Restore-defaults button are centered.
+  log("== Settings → Batch reliability ==");
+  const reliabilityHeading = page
+    .getByRole("heading", { name: /^Batch reliability$/ })
+    .first();
+  if ((await reliabilityHeading.count()) > 0) {
+    try {
+      await reliabilityHeading.scrollIntoViewIfNeeded();
+      await page.waitForTimeout(300);
+      await snap(page, "12d-batch-reliability-card");
+    } catch (err) {
+      log("  could not scroll to batch reliability card:", err.message);
+    }
+  } else {
+    log("  batch reliability heading not found, skipping 12d");
+  }
+}
+
+async function captureSettingsInstall(page) {
+  // 17 — Install card. Lives at the top of /settings; we re-navigate
+  // so the page starts scrolled to top regardless of which card the
+  // previous capture left visible. Headless Chromium doesn't fire
+  // `beforeinstallprompt`, so the deterministic state is "Browser-
+  // managed install" — exactly what curators on Safari/Firefox see
+  // and the documentation describes.
+  log("== Settings → Install ==");
+  await gotoMock(page, "/settings");
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.waitForTimeout(300);
+  const installHeading = page
+    .getByRole("heading", { name: /Install for offline use/ })
+    .first();
+  if ((await installHeading.count()) > 0) {
+    await installHeading.scrollIntoViewIfNeeded().catch(() => {});
+    await page.waitForTimeout(200);
+    await snap(page, "17-install-pwa");
+  } else {
+    log("  install card heading not found, skipping 17");
   }
 }
 
@@ -495,6 +579,7 @@ async function main() {
     await captureProjectSettings(page);
     await captureLoreBooks(page);
     await captureSettingsLlm(page);
+    await captureSettingsInstall(page);
     await captureIntakeRuns(page);
     await captureLlmActivity(page);
     await captureCheatSheet(page);
