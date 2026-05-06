@@ -4,7 +4,10 @@
  *
  * Targets the `/v1/chat/completions` shape and works against any
  * provider that speaks it: OpenAI, Azure OpenAI, OpenRouter, Together,
- * Ollama (with `OLLAMA_ORIGINS=*`), vLLM, llama.cpp.
+ * Ollama (relaunched with the multi-scheme allow-list
+ * `OLLAMA_ORIGINS="http://*,https://*,chrome-extension://*,moz-extension://*"`
+ * — the bare `*` shorthand is parsed inconsistently across Ollama
+ * releases), vLLM, llama.cpp.
  *
  * Implementation notes (browser-specific):
  *
@@ -589,7 +592,8 @@ export function explainFetchFailure(err: unknown, url: string): string {
         `from calling the plaintext loopback URL ${url}). Chrome 142+ uses ` +
         `Local Network Access (LNA): epublatejs already requests permission ` +
         `via \`fetch(..., { targetAddressSpace: "loopback" })\`, but Chrome ` +
-        `must prompt you and you must Allow it. ` +
+        `must prompt you and you must Allow it AND Ollama itself must allow ` +
+        `the HTTPS origin via CORS. ` +
         `Fix paths in order of reliability: ` +
         `(1) run the SPA from http://localhost — \`npm run dev\` or ` +
         `\`npm run preview\`, since loopback→loopback over HTTP needs no ` +
@@ -605,8 +609,15 @@ export function explainFetchFailure(err: unknown, url: string): string {
         `the browser. The legacy Chrome flag ` +
         `\`--disable-features=BlockInsecurePrivateNetworkRequests\` does NOT ` +
         `help here — it targeted the deprecated PNA system, not LNA. ` +
-        `Confirm Ollama itself is reachable with: \`curl -i ` +
-        `${describeUrlOrigin(url) ?? "http://localhost:11434"}/v1/models\`.`
+        `On the Ollama side, restart it with the multi-scheme allow-list — ` +
+        OLLAMA_ORIGINS_RECIPE +
+        ` — the bare \`OLLAMA_ORIGINS=*\` is parsed differently across ` +
+        `Ollama versions and often skips https:// origins, which is why ` +
+        `Vercel deploys still fail. ` +
+        `Confirm Ollama itself is reachable with: \`curl -H 'Origin: ` +
+        `${page_origin ?? "https://example.com"}' -i ` +
+        `${describeUrlOrigin(url) ?? "http://localhost:11434"}/v1/models\` ` +
+        `— the response must include \`Access-Control-Allow-Origin\`.`
       );
     }
     if (page_is_https && target_is_http && is_private) {
@@ -616,32 +627,57 @@ export function explainFetchFailure(err: unknown, url: string): string {
         `Local Network Access / mixed-content rejection. Either move the ` +
         `endpoint behind HTTPS (Tailscale, Cloudflare Tunnel, ngrok), run ` +
         `the SPA from http:// itself, or grant the LNA permission at ` +
-        `chrome://settings/content/localNetworkAccess.`
+        `chrome://settings/content (look for "Local Network Access" / ` +
+        `"Loopback Network"). If you do tunnel through HTTPS, also restart ` +
+        `Ollama with the multi-scheme allow-list — ` +
+        OLLAMA_ORIGINS_RECIPE +
+        ` — so its CORS layer accepts https:// origins.`
       );
     }
     if (is_loopback) {
       return (
         `${msg} (the browser blocked the request to ${url} — Ollama is ` +
         `usually reachable on this address). Confirm \`ollama serve\` is ` +
-        `running and was launched with \`OLLAMA_ORIGINS=*\` (the env var ` +
-        `must be set on the *server* process; restart Ollama after ` +
-        `setting it). On macOS launchd, run ` +
-        `\`launchctl setenv OLLAMA_ORIGINS '*'\` then ` +
+        `running and was launched with the multi-scheme allow-list — ` +
+        OLLAMA_ORIGINS_RECIPE +
+        ` — the env var must be set on the *server* process; restart ` +
+        `Ollama after setting it. On macOS launchd, run ` +
+        `\`launchctl setenv OLLAMA_ORIGINS "http://*,https://*,` +
+        `chrome-extension://*,moz-extension://*"\` then ` +
         `\`launchctl kickstart -k user/$UID/com.ollama.ollama\`. Verify ` +
         `with \`curl -H 'Origin: ${page_origin ?? "https://example.com"}' ` +
         `-i http://localhost:11434/v1/models\` — the response must include ` +
-        `\`Access-Control-Allow-Origin\`.`
+        `\`Access-Control-Allow-Origin\`. The bare \`OLLAMA_ORIGINS=*\` ` +
+        `shorthand is parsed differently across Ollama releases and often ` +
+        `skips https:// origins; the explicit list is portable.`
       );
     }
     return (
       `${msg} (the browser blocked the request to ${hostname} — usually ` +
       `a CORS rejection, an expired DNS record, or the endpoint being ` +
-      `offline). For local Ollama, set OLLAMA_ORIGINS=*; for cloud ` +
-      `endpoints, confirm the URL responds to a curl POST.`
+      `offline). For local Ollama, restart it with ` +
+      OLLAMA_ORIGINS_RECIPE +
+      `; for cloud endpoints, confirm the URL responds to a curl POST.`
     );
   }
   return msg;
 }
+
+/**
+ * The Ollama allow-list value we ship in every CORS-related hint.
+ *
+ * The bare wildcard `OLLAMA_ORIGINS=*` is the form most blog posts
+ * recommend, but several Ollama releases (notably the macOS desktop
+ * app's bundled server) parse it as "exact-string match against `*`"
+ * and reject browser requests whose `Origin` header is anything else
+ * (e.g. an `https://*.vercel.app` deploy). The comma-separated
+ * scheme-wildcard form below is the value Ollama's own FAQ suggests
+ * for "open it up to the local network", and it's the one curators
+ * have reported as actually unblocking HTTPS deploys.
+ */
+const OLLAMA_ORIGINS_RECIPE =
+  "`export OLLAMA_ORIGINS=\"http://*,https://*,chrome-extension://*," +
+  "moz-extension://*\" && ollama serve`";
 
 function currentOrigin(): string | null {
   try {

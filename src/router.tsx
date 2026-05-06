@@ -4,6 +4,7 @@ import { AppShell } from "@/components/layout/AppShell";
 import { ProjectsRoute } from "@/routes/ProjectsRoute";
 import { DashboardRoute } from "@/routes/DashboardRoute";
 import { GlossaryRoute } from "@/routes/GlossaryRoute";
+import { HelpRoute } from "@/routes/HelpRoute";
 import { InboxRoute } from "@/routes/InboxRoute";
 import { IntakeRunsRoute } from "@/routes/IntakeRunsRoute";
 import { LlmActivityRoute } from "@/routes/LlmActivityRoute";
@@ -21,6 +22,7 @@ export const router = createBrowserRouter([
     element: <AppShell />,
     children: [
       { index: true, element: <ProjectsRoute /> },
+      { path: "help", element: <HelpRoute /> },
       { path: "settings", element: <SettingsRoute /> },
       { path: "lore", element: <LoreBooksRoute /> },
       { path: "lore/:loreId", element: <LoreBookDashboardRoute /> },

@@ -70,7 +70,7 @@ Style guide, context window, budget cap, and per-project LLM overrides — the s
 
 ## Highlights
 
-- **Sectioned navigation.** Library (Projects, Lore Books) is always visible; the Project section appears when a book is open and groups Dashboard, Reader, Glossary, Inbox, Project Settings, and the advanced views (LLM activity, Intake runs, Logs).
+- **Sectioned navigation.** Library (Projects, Lore Books) is always visible; the Project section appears when a book is open and groups Dashboard, Reader, Glossary, Inbox, Project Settings, and the advanced views (LLM activity, Intake runs, Logs). The sidebar footer surfaces global links — **Help & guides**, Settings, theme picker — including a deep-linkable in-app tutorial at `/help` that mirrors this README's onboarding plus the multi-scheme `OLLAMA_ORIGINS` recipe so curators on a deployed HTTPS build can troubleshoot without leaving the SPA.
 - **Reader with side-by-side panes**, scroll-sync that's anchored to segments rather than pixels (because translated text is rarely the same length), keyboard-first hotkeys, and per-project position memory — leave the Reader and come back to the same chapter, the same segment, the same scroll offset.
 - **Glossary** with proposed / approved / locked statuses, alias support on both source and target sides, target-only entries (for invented terms), JSON / CSV import-export, and an Inbox flow for cascade re-translation when a locked term changes.
 - **Lore Books**: standalone, attachable per-project lore artifacts. Ingest from a translated reference ePub, ingest from a source ePub via helper LLM, or import from another project. Attach with read-only or writable mode and a per-attachment priority.
@@ -107,7 +107,7 @@ Then:
   <img src="docs/screenshots/02-new-project-modal.png" alt="The New project modal with petitprince.epub already loaded, source language fr, target language en, the Literary fiction preset selected with its prose contract preview, and the helper-LLM auto-intake checkbox enabled." width="100%" />
 </p>
 
-For a deeper walk-through, see [**docs/USAGE.md**](docs/USAGE.md).
+For a deeper walk-through, see [**docs/USAGE.md**](docs/USAGE.md). The same tour is also bundled into the SPA itself at **Help & guides** in the sidebar footer (`/help`) — handy when you're showing the app to someone new or troubleshooting a connectivity problem on a deployed build.
 
 ### Try it without an LLM key
 
@@ -242,7 +242,12 @@ Bundles are forward-compatible: older clients refuse newer schemas with a clear 
 
 ## Browser realities
 
-- **CORS** — works against OpenAI, OpenRouter, Together, Groq, DeepInfra, and any other OpenAI-compatible service. Local **Ollama** requires `OLLAMA_ORIGINS=*` so the browser is allowed to call it.
+- **CORS** — works against OpenAI, OpenRouter, Together, Groq, DeepInfra, and any other OpenAI-compatible service. Local **Ollama** requires the multi-scheme allow-list so its CORS layer accepts both http:// and https:// origins (the bare `OLLAMA_ORIGINS=*` shorthand is parsed inconsistently across Ollama releases and often rejects https:// deploys):
+
+  ```bash
+  export OLLAMA_ORIGINS="http://*,https://*,chrome-extension://*,moz-extension://*"
+  ollama serve
+  ```
 - **Ollama options** — when the base URL looks like Ollama (`:11434` / `ollama` host), Settings surfaces a dedicated card for `num_ctx`, `num_predict`, sampling, Mirostat, and a **Disable thinking** toggle (`think: false`, the documented Ollama switch for Gemma 3 / Qwen 3 / DeepSeek-R1 / GPT-OSS) with one-click presets. Cloud providers ignore the extra body fields, so the values stick around safely if you swap models. See [USAGE → Ollama options](docs/USAGE.md#ollama-options-optional-auto-detected).
 - **Reasoning models** — `reasoning_effort` accepts the standard `minimal` / `low` / `medium` / `high` ladder plus an Ollama-compat `none`, so you can suppress thinking on cloud o-series and Ollama alike from a single project config. See [USAGE → LLM endpoint](docs/USAGE.md#llm-endpoint).
 - **API keys** are stored in IndexedDB on this device only. They are never logged outside the LLM audit row, which itself stays local. The Settings screen has redact / clear actions.
@@ -276,6 +281,7 @@ Bundles are forward-compatible: older clients refuse newer schemas with a clear 
 
 | Doc                                                | What's in it                                                                                  |
 | -------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| In-app **Help & guides** (`/help`)                 | Onboarding tour, local-Ollama recipe with copy-button code blocks, troubleshooting accordion — works offline once the SPA is installed. |
 | [`docs/USAGE.md`](docs/USAGE.md)                   | Hands-on tour of every screen with screenshots and concept tables.                            |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)     | Architectural deep dive: layers, modules, data flow, cache key, batch state machine, ePub round-trip. |
 | [`AGENTS.md`](AGENTS.md)                           | Hard invariants and conventions for AI agents (and humans) modifying the codebase.            |

@@ -5,6 +5,8 @@ A tour of the app from "I just opened it" to "I have a translated ePub on my dis
 > Screenshots live in [`docs/screenshots/`](screenshots). They're captured deterministically by `tools/snap.mjs` against `?mock=1`; see the screenshot folder's [README](screenshots/README.md) for how to refresh them.
 >
 > If you want the developer-side counterpart (modules, data flow, cache key recipe, ePub round-trip invariants), read [**ARCHITECTURE.md**](ARCHITECTURE.md) next.
+>
+> **Prefer in-app help?** This doc is mirrored, in tour-card form, at the **Help & guides** route in the running SPA — open it from the sidebar footer. The in-app version always matches the build you're using and works offline once the SPA is installed; this markdown file is the longer narrative for repo readers.
 
 ## Table of contents
 
@@ -26,8 +28,9 @@ A tour of the app from "I just opened it" to "I have a translated ePub on my dis
 16. [Project bundles & moving devices](#project-bundles--moving-devices)
 17. [Keyboard shortcuts](#keyboard-shortcuts)
 18. [Themes & mock mode](#themes--mock-mode)
-19. [Troubleshooting](#troubleshooting)
-20. [FAQ](#faq)
+19. [The in-app Help & guides screen](#the-in-app-help--guides-screen)
+20. [Troubleshooting](#troubleshooting)
+21. [FAQ](#faq)
 
 ---
 
@@ -567,6 +570,42 @@ The sidebar footer has a compact theme picker and the mock-mode banner.
 
 ---
 
+## The in-app Help & guides screen
+
+![Help & guides — hero, fact pills, ToC, and the start of the Quickstart card grid](screenshots/18-help.png)
+
+Open **Help & guides** from the sidebar footer (or jump to `/help`). It's a single, scrollable tour that mirrors this doc's most-needed sections without you having to leave the SPA — handy when you're showing someone the app for the first time, or troubleshooting connectivity from a deployed build that can't reach this markdown file offline.
+
+The page is anchored — every section has a stable `id` so deep links keep working forever:
+
+| Section                | Anchor                  | Why you'd jump here                                                          |
+| ---------------------- | ----------------------- | ---------------------------------------------------------------------------- |
+| Quickstart             | `#quickstart`           | Five-step starter card grid: connect → import → tune → translate → export.   |
+| Local Ollama           | `#local-llm`            | Install, the multi-scheme `OLLAMA_ORIGINS` recipe, paste-into-settings, plus the LNA story for HTTPS deploys hitting `http://localhost`. |
+| Cloud LLMs             | `#cloud-llm`            | Provider-by-provider table (OpenAI, OpenRouter, Together, Groq, DeepInfra) with copy-ready base URLs. |
+| Workflow tour          | `#workflow`             | Visual walkthrough of Projects, Dashboard, Reader, Prompt preview, Glossary, Inbox, LLM activity. |
+| Prompts & summaries    | `#prompts`              | What the prompt-options checkboxes do, what the simulator shows, what changes when you toggle book / chapter summaries. |
+| Privacy                | `#privacy`              | Two side-by-side lists: what stays on this device, what crosses the wire.    |
+| Keyboard shortcuts     | `#keyboard`             | Snapshot of the cheat sheet (live version is one keystroke away with `?` / F1). |
+| Troubleshooting        | `#troubleshooting`      | Collapsible answers for the five most-asked snags.                           |
+| Further reading        | `#further-reading`      | Links to README, ARCHITECTURE, USAGE on GitHub for the longer narrative.     |
+
+The Local Ollama section is the most-frequented stop — it's the rough edge most curators hit first, especially on HTTPS deploys.
+
+![Help & guides → Connect a local LLM (Ollama) — install command + the OLLAMA_ORIGINS recipe scrolled into view](screenshots/18b-help-ollama.png)
+
+Three things make it actionable:
+
+- The exact `export OLLAMA_ORIGINS="http://*,https://*,chrome-extension://*,moz-extension://*"` value is pre-formatted in a copy-button code block, so you can re-paste it without retyping the four schemes.
+- The `launchctl` recipe for macOS users running Ollama as a launchd service is right next to the bare-shell version.
+- The HTTPS-deploy ↔ `http://localhost` panel walks through Local Network Access (LNA) in step-by-step form — what to click in `chrome://settings/content`, what flag to disable in `chrome://flags` only as a last resort, and the three working tunnel commands (Tailscale, Cloudflare, ngrok) when you'd rather make Ollama HTTPS once and forget.
+
+The Help page never makes a network call — it's pure rendered Markdown-flavoured TSX. Refreshing it offline (after the SPA is installed via Workbox) works exactly the same as when you're online.
+
+> **Adding to the Help page.** When you change a screen the help page references, refresh the screenshot via `node tools/snap-help.mjs` and update the relevant section in `src/routes/HelpRoute.tsx`. The Help route deliberately reuses `docs/screenshots/` (not a copy in `public/`) so the doc-set rule keeps both surfaces honest.
+
+---
+
 ## Troubleshooting
 
 ### "Translation failed: network error" / "Failed to execute 'fetch' on 'Window'"
@@ -586,20 +625,21 @@ The model isn't on the endpoint. Check the endpoint's documentation for the exac
 
 ### My CORS-only Ollama endpoint fails
 
-Ollama disables browser CORS by default. Run it with `OLLAMA_ORIGINS=*` (or a specific origin):
+Ollama disables browser CORS by default. Run it with the explicit multi-scheme allow-list — `OLLAMA_ORIGINS=*` is the form most blog posts recommend, but several Ollama releases (notably the macOS desktop app's bundled server) parse it as exact-string match against `*` and reject browser requests whose `Origin` header is anything else (e.g. an `https://*.vercel.app` deploy). The explicit list below is portable across Ollama versions and is what curators have reported as actually unblocking HTTPS deploys:
 
 ```bash
-OLLAMA_ORIGINS=* ollama serve
+export OLLAMA_ORIGINS="http://*,https://*,chrome-extension://*,moz-extension://*"
+ollama serve
 ```
 
 If you launched Ollama via `launchctl` (the default on macOS via the Ollama desktop app) the env var must be set on the daemon, not your shell:
 
 ```bash
-launchctl setenv OLLAMA_ORIGINS '*'
+launchctl setenv OLLAMA_ORIGINS "http://*,https://*,chrome-extension://*,moz-extension://*"
 launchctl kickstart -k user/$UID/com.ollama.ollama
 ```
 
-Verify it's actually being honoured:
+Verify it's actually being honoured (replace the origin with whatever the SPA is served from):
 
 ```bash
 curl -i \
@@ -610,9 +650,26 @@ curl -i \
 
 ### My HTTPS deploy can't reach `http://localhost:11434`
 
-This is the one that bites the hardest after a `vercel deploy`. The error toast you'll see is "Failed to fetch (the browser blocked the HTTPS page at https://… from calling the plaintext loopback URL http://localhost:11434/…)". It's **not** CORS, and **not** a bug in epublatejs — Chrome 142+ enforces a model called **Local Network Access (LNA)**: an HTTPS page calling `http://localhost:…` is blocked as mixed content unless the fetch is annotated with `targetAddressSpace: "loopback"` *and* the user has granted the LNA permission for that origin. `OLLAMA_ORIGINS=*` (CORS) does not bypass either of those checks.
+This is the one that bites the hardest after a `vercel deploy`. The error toast you'll see is "Failed to fetch (the browser blocked the HTTPS page at https://… from calling the plaintext loopback URL http://localhost:11434/…)". It's **not** a bug in epublatejs — there are *two* gates the request has to clear and a fresh deploy fails both:
 
-epublatejs already passes `targetAddressSpace: "loopback"` on every fetch to a loopback / RFC1918 endpoint (see [`src/llm/private_network.ts`](../src/llm/private_network.ts)), so Chrome *will* prompt you the first time you press **Test connection** in Settings or run a batch. After that, four known-good fixes in order of convenience:
+1. **Browser side** — Chrome 142+ enforces **Local Network Access (LNA)**: an HTTPS page calling `http://localhost:…` is blocked as mixed content unless the fetch is annotated with `targetAddressSpace: "loopback"` *and* the user has granted the LNA permission for that origin. epublatejs already passes the annotation on every fetch to a loopback / RFC1918 endpoint (see [`src/llm/private_network.ts`](../src/llm/private_network.ts)), so Chrome *will* prompt you the first time you press **Test connection**.
+2. **Ollama side** — Ollama's CORS layer must allow your `https://*.vercel.app` origin. The bare `OLLAMA_ORIGINS=*` shorthand parses inconsistently across Ollama releases and often skips https:// origins, which is why curators report Vercel deploys still failing even after they "set OLLAMA_ORIGINS". Use the explicit multi-scheme allow-list instead.
+
+After deploying the SPA, walk through these in order:
+
+0. **Restart Ollama with the multi-scheme allow-list** so its CORS layer accepts `https://` origins (this is the step the wildcard shorthand often misses):
+
+   ```bash
+   export OLLAMA_ORIGINS="http://*,https://*,chrome-extension://*,moz-extension://*"
+   ollama serve
+   ```
+
+   On macOS via the Ollama desktop app, set it on the daemon and bounce:
+
+   ```bash
+   launchctl setenv OLLAMA_ORIGINS "http://*,https://*,chrome-extension://*,moz-extension://*"
+   launchctl kickstart -k user/$UID/com.ollama.ollama
+   ```
 
 1. **Click Allow on Chrome's "Local Network Access" prompt.** It only appears once per origin and persists. If you accidentally dismissed it, re-grant it at `chrome://settings/content` (look for *"Local Network Access"* / *"Loopback Network"* — the section name was split in Chrome 145).
 2. **Run the SPA over HTTP locally.** `npm run dev` (Vite, port 5173) or `npm run preview` (port 4173) is loopback→loopback over HTTP — Chrome treats it as a Secure Context, no LNA prompt, no mixed content. This is the friction-free path for solo curating.
@@ -668,7 +725,7 @@ Every edit writes a `segment.edited` event to the audit log; nothing is irrevers
 
 What still needs network: making *new* LLM calls (anything that wasn't already in the cache) and pulling fresh embeddings from a remote provider. The sidebar shows a yellow "Offline" pill when `navigator.onLine` is false so you know which calls will fail.
 
-**Can I run the LLM call against my own self-hosted model?** Yes — anything OpenAI-compatible. We've tested OpenAI, OpenRouter, Together, Groq, DeepInfra, and Ollama (with `OLLAMA_ORIGINS=*`).
+**Can I run the LLM call against my own self-hosted model?** Yes — anything OpenAI-compatible. We've tested OpenAI, OpenRouter, Together, Groq, DeepInfra, and Ollama (relaunch it with `OLLAMA_ORIGINS="http://*,https://*,chrome-extension://*,moz-extension://*"` so its CORS layer accepts both http:// and https:// origins — the bare `*` shorthand is parsed inconsistently across Ollama releases).
 
 **Do you support reasoning models?** Yes — and you can also turn reasoning off, which is usually what a translation pipeline wants. Settings → LLM and Project Settings → LLM overrides expose a `reasoning_effort` knob with the standard `minimal` / `low` / `medium` / `high` values plus an Ollama-compat **`none`** option for endpoints that recognise it. To turn thinking off on local Ollama specifically, prefer the **Disable thinking** tri-state in the Ollama options card — it sends `think: false` as a top-level body field, which is the model-agnostic toggle Ollama documents for Gemma 3 / Qwen 3 / DeepSeek-R1 / GPT-OSS. Cloud providers ignore the unknown field, so a single project config works regardless of which endpoint is active.
 

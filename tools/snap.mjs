@@ -595,6 +595,38 @@ async function captureProjectsPopulated(page) {
   await snap(page, "01b-projects-populated");
 }
 
+async function captureHelp(page) {
+  // Help page lives at /help. Two captures: the hero / quickstart at
+  // the top, and the Ollama-setup card scrolled into view because
+  // that's the connectivity recipe most curators are looking for.
+  log("== Help & guides ==");
+  await gotoMock(page, "/help");
+  // The route runs an effect on mount that scrolls to the URL hash;
+  // wait a beat so any hash-driven scroll has settled before we snap.
+  await page.waitForTimeout(600);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.waitForTimeout(300);
+  await snap(page, "18-help");
+
+  // Click the ToC pill for "Local Ollama" so the section scrolls into
+  // view. Falls back to a hash navigation if the locator misses.
+  log("== Help & guides → Local Ollama ==");
+  const ollamaPill = page
+    .locator('a[href="#local-llm"]')
+    .first();
+  if ((await ollamaPill.count()) > 0) {
+    await ollamaPill.click().catch(() => {});
+  } else {
+    await page
+      .evaluate(() => {
+        window.location.hash = "local-llm";
+      })
+      .catch(() => {});
+  }
+  await page.waitForTimeout(700);
+  await snap(page, "18b-help-ollama");
+}
+
 async function captureHero(page) {
   log("== Hero (Dashboard) ==");
   // Reuse the dashboard with a translated batch.
@@ -644,6 +676,7 @@ async function main() {
     await captureLlmActivity(page);
     await captureCheatSheet(page);
     await captureThemes(page);
+    await captureHelp(page);
     await captureProjectsPopulated(page);
     // Use the populated dashboard as the hero.
     const id = await getProjectId(page);

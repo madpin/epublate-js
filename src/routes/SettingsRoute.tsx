@@ -196,7 +196,11 @@ export function SettingsRoute(): React.JSX.Element {
             <CardTitle>LLM endpoint</CardTitle>
             <CardDescription>
               OpenAI-compatible: OpenAI, OpenRouter, Together, Groq, …. Local
-              Ollama works after setting <code>OLLAMA_ORIGINS=*</code>.
+              Ollama works after restarting it with{" "}
+              <code>
+                OLLAMA_ORIGINS="http://*,https://*,chrome-extension://*,moz-extension://*"
+              </code>
+              .
             </CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4">
@@ -755,6 +759,17 @@ function MixedContentWarning({
       142+ <em>ask</em> for permission via the Local Network Access
       prompt. If the call still fails, walk through these in order:
       <ol className="mt-1 list-decimal space-y-0.5 pl-5">
+        <li>
+          <strong>Restart Ollama with the multi-scheme allow-list</strong>{" "}
+          so its CORS layer accepts your <code>https://</code> origin
+          — the bare <code>OLLAMA_ORIGINS=*</code> shorthand is parsed
+          differently across Ollama versions and often rejects
+          https:// origins:
+          <pre className="mt-1 overflow-x-auto whitespace-pre rounded bg-amber-100/60 px-2 py-1 font-mono text-[11px] dark:bg-amber-900/40">
+{`export OLLAMA_ORIGINS="http://*,https://*,chrome-extension://*,moz-extension://*"
+ollama serve`}
+          </pre>
+        </li>
         <li>
           When you press <strong>Test connection</strong>, watch for
           Chrome's "Local Network Access" prompt and click{" "}

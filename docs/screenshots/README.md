@@ -16,8 +16,10 @@ The script:
 1. Resets every IndexedDB DB the SPA owns (clean slate every run).
 2. Creates a project from `tests/fixtures/petitprince.epub` via the New Project modal, with `auto_intake = true` and `tone_sniff = false` for deterministic helper-LLM behaviour.
 3. Walks the project-level screens by SPA navigation (preserving Dexie context across hops):
-   - Projects empty → New Project modal → Dashboard → Translate batch → Dashboard (translated) → Reader (Chapitre III, prose-rich) → Glossary → Inbox → Project Settings (default + **Relevant context mode**) → Lore Books → Settings → LLM (default + **Embeddings card** + **Install card**) → Intake runs → LLM activity → Cheat sheet → Theme picker → Projects populated → Hero (Dashboard).
+   - Projects empty → New Project modal → Dashboard → Translate batch → Dashboard (translated) → Reader (Chapitre III, prose-rich) → Glossary → Inbox → Project Settings (default + **Relevant context mode**) → Lore Books → Settings → LLM (default + **Embeddings card** + **Install card**) → Intake runs → LLM activity → Cheat sheet → Theme picker → **Help & guides (hero + Local Ollama section)** → Projects populated → Hero (Dashboard).
 4. Saves PNGs into this folder using the contract filenames listed below.
+
+When only the Help & guides route changed, you can skip the full sweep and run `node tools/snap-help.mjs` instead — it defaults to `:5174` (the port Vite picks when `:5173` is in use); point it elsewhere with `BASE_URL=http://localhost:5173`.
 
 The capture runs at viewport `1024 × 640` against the default `epublate` theme. To re-capture in a different theme, set `THEME` in the script (`epublate`, `textual-dark`, `textual-light`, `epublate-contrast`).
 
@@ -55,6 +57,8 @@ The capture runs at viewport `1024 × 640` against the default `epublate` theme.
 | 16 | `15-cheat-sheet.png`                  | Cheat sheet         | Keyboard-shortcut dialog (`?` / `F1`).                                                            |
 | 17 | `16-themes.png`                       | Theme picker        | Sidebar-footer theme dropdown open with all four themes listed.                                   |
 | 18 | `17-install-pwa.png`                  | Settings → Install  | Install card scrolled into view: install-state pill, "App cached for offline use" pill, online/offline pill, and the **Install epublate** button. Headless Chromium doesn't fire `beforeinstallprompt`, so the deterministic state is "Browser-managed install" with the explanatory hint visible. |
+| 19 | `18-help.png`                         | Help & guides       | Top of the in-app Help & guides route — hero strip, fact pills, CTA buttons, ToC, and the start of the Quickstart card grid. |
+|    | `18b-help-ollama.png`                 | Help & guides → Local Ollama | The Help page scrolled to the **Connect a local LLM (Ollama)** section: install command + the multi-scheme `OLLAMA_ORIGINS` recipe that ships in the on-screen tutorial. |
 
 The capture script does *not* exercise the per-chapter Translate Chapter modal (`05b`) or the Lore Book dashboard (`11`) yet; both are described in prose in `docs/USAGE.md` until we wire them up.
 

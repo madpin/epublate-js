@@ -569,7 +569,7 @@ Two concrete implementations. The factory at `src/llm/factory.ts` decides which 
 
 ### `OpenAICompatProvider`
 
-Speaks `/v1/chat/completions`. Works against OpenAI, Azure OpenAI, OpenRouter, Together, Groq, DeepInfra, Ollama (with `OLLAMA_ORIGINS=*`), vLLM, and llama.cpp. The browser-specific scaffolding:
+Speaks `/v1/chat/completions`. Works against OpenAI, Azure OpenAI, OpenRouter, Together, Groq, DeepInfra, Ollama (relaunched with `OLLAMA_ORIGINS="http://*,https://*,chrome-extension://*,moz-extension://*"` — the bare `*` shorthand is parsed inconsistently across Ollama releases), vLLM, and llama.cpp. The browser-specific scaffolding:
 
 - **Retry loop with full-jitter exponential backoff.** Same retry semantics as the Python tool: respects `Retry-After` and `X-RateLimit-Reset` headers up to a `RATE_LIMIT_SHORT_WAIT_CAP_SECONDS = 120` ceiling, then surfaces a typed `LLMRateLimitError` so the orchestrator can pause cleanly.
 - **CORS-aware error mapping.** Browser-side, a CORS rejection comes through as a generic `TypeError`. We catch it and re-throw as `LLMError("network error")` with a hint pointing at the Settings docs.
@@ -736,6 +736,7 @@ Single React Router 7 tree, all wrapped in `AppShell`:
 flowchart TB
   shell["AppShell<br/>sidebar · header · BatchStatusBar · Toaster"]
   shell --> root["/<br/>ProjectsRoute"]
+  shell --> help["/help<br/>HelpRoute"]
   shell --> settings["/settings<br/>SettingsRoute"]
   shell --> lore["/lore<br/>LoreBooksRoute"]
   shell --> loredash["/lore/:loreId<br/>LoreBookDashboardRoute"]
@@ -755,7 +756,7 @@ The sidebar splits into three sections:
 
 - **Library** (always visible): Projects, Lore Books.
 - **Project** (visible when a project is "open"): Dashboard, Reader, Glossary, Inbox, plus secondary advanced screens (Intake runs, LLM activity, Logs, Project settings).
-- **Footer**: global Settings, theme picker, mock-mode banner.
+- **Footer**: global **Help & guides**, Settings, theme picker, mock-mode banner. The Help link opens [src/routes/HelpRoute.tsx](../src/routes/HelpRoute.tsx) — an in-app onboarding tour with deep-linkable anchors (`#quickstart`, `#local-llm`, `#troubleshooting`, …) that mirrors the most-needed slices of [USAGE.md](USAGE.md), notably the multi-scheme `OLLAMA_ORIGINS` recipe and the LNA-permission walkthrough for HTTPS deploys hitting `http://localhost`. It pulls its screenshots from `docs/screenshots/` via Vite's `import.meta.glob({ query: "?url" })` so the doc-set rule keeps a single source of truth — no duplicate `public/help/` folder.
 
 A project is "open" when the URL has `/project/:projectId` *or* when the curator has visited a project recently — `useLastProjectStore` remembers the most recent id so the Project section doesn't collapse the moment the curator clicks Settings or Lore Books. If the remembered project has been deleted, the AppShell silently degrades to the no-project view (`useLiveQuery` returns null).
 

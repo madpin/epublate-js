@@ -104,6 +104,11 @@ describe("OpenAICompatProvider header hardening", () => {
       expect(hint).toContain("https://epublate.example.app");
       expect(hint).toContain("tailscale serve");
       expect(hint).toContain("targetAddressSpace");
+      // Both gates need to be cleared: LNA permission AND Ollama's
+      // CORS allow-list. Surface the multi-scheme recipe so the
+      // curator doesn't fall into the bare-`*` trap.
+      expect(hint).toContain("OLLAMA_ORIGINS");
+      expect(hint).toContain("https://*");
       // Should keep the practical curl probe intact.
       expect(hint).toContain("/v1/models");
     } finally {
@@ -133,6 +138,11 @@ describe("OpenAICompatProvider header hardening", () => {
         "http://localhost:11434/v1/chat/completions",
       );
       expect(hint).toContain("OLLAMA_ORIGINS");
+      // The bare `*` is too ambiguous; insist on the multi-scheme
+      // allow-list. https:// in the value confirms the recipe will
+      // unblock Vercel deploys, not just localhost-on-localhost.
+      expect(hint).toContain("https://*");
+      expect(hint).toContain("chrome-extension://*");
       expect(hint).toContain("launchctl");
       expect(hint).toContain("Access-Control-Allow-Origin");
     } finally {

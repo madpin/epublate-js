@@ -43,6 +43,7 @@ import {
   Database,
   FlaskConical,
   Home,
+  LifeBuoy,
   Library,
   ListChecks,
   Logs,
@@ -198,6 +199,14 @@ export function AppShell(): React.JSX.Element {
         </nav>
 
         <div className="border-t px-2 py-3">
+          <SidebarLink
+            item={{
+              to: "/help",
+              label: "Help & guides",
+              icon: LifeBuoy,
+            }}
+            to="/help"
+          />
           <SidebarLink
             item={{
               to: "/settings",

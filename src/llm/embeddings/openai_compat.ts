@@ -4,8 +4,9 @@
  *
  * Targets the `/v1/embeddings` shape and works against any provider
  * that speaks it: OpenAI, Azure OpenAI, OpenRouter, Together, Ollama
- * (`OLLAMA_ORIGINS=*`), vLLM, llama.cpp, BAAI/bge-* on a self-hosted
- * inference server.
+ * (relaunched with the multi-scheme allow-list
+ * `OLLAMA_ORIGINS="http://*,https://*,chrome-extension://*,moz-extension://*"`),
+ * vLLM, llama.cpp, BAAI/bge-* on a self-hosted inference server.
  *
  * Mirrors the retry / backoff / Retry-After parsing behavior in
  * `@/llm/openai_compat` so curators see the same failure semantics
