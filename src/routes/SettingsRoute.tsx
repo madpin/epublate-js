@@ -1,14 +1,17 @@
 import * as React from "react";
 import { toast } from "sonner";
 import {
+  Cloud,
   DollarSign,
   Eye,
   EyeOff,
+  HardDrive,
   Loader2,
   PlugZap,
   Plus,
   RotateCcw,
   Trash2,
+  Workflow,
 } from "lucide-react";
 
 import { OpenAICompatProvider } from "@/llm/openai_compat";
@@ -19,6 +22,7 @@ import {
   listEffectivePricing,
 } from "@/llm/pricing";
 import { useAppStore } from "@/state/app";
+import { LLM_PRESETS, type LlmPreset } from "@/lib/env_defaults";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -36,6 +40,22 @@ import { BatchReliabilityCard } from "@/components/settings/BatchReliabilityCard
 import { EmbeddingsCard } from "@/components/settings/EmbeddingsCard";
 import { InstallCard } from "@/components/settings/InstallCard";
 import { OllamaOptionsCard } from "@/components/settings/OllamaOptionsCard";
+
+/**
+ * Icon lookup for each preset. Keep colocated with the route so the
+ * icon library import stays where it's used; preset *data* lives in
+ * `@/lib/env_defaults` and is shared with future surfaces (CLI
+ * stubs, onboarding wizards, …) that shouldn't depend on a lucide
+ * icon set.
+ */
+const PRESET_ICONS: Record<
+  LlmPreset["id"],
+  React.ComponentType<{ className?: string }>
+> = {
+  openai: Cloud,
+  openrouter: Workflow,
+  ollama: HardDrive,
+};
 
 /**
  * Settings screen.
@@ -204,6 +224,24 @@ export function SettingsRoute(): React.JSX.Element {
             </CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4">
+            <PresetRow
+              onPick={(preset) => {
+                // Presets only touch the form drafts — exactly like
+                // typing into the URL/model fields. The API key
+                // field is intentionally left alone (curators own
+                // that decision; clobbering would lose work in
+                // progress).
+                setBaseUrl(preset.base_url);
+                setModel(preset.model);
+                if (preset.helper_model) {
+                  setHelperModel(preset.helper_model);
+                }
+                toast.message(`${preset.label} preset loaded`, {
+                  description: preset.hint,
+                  duration: 6_000,
+                });
+              }}
+            />
             <div className="grid gap-2">
               <Label htmlFor="base_url">Base URL</Label>
               <Input
@@ -814,6 +852,58 @@ ollama serve`}
  * - Positive integer ⇒ accepted.
  * - 0 / negative / non-numeric ⇒ unset + warning.
  */
+/**
+ * Quick-presets row above the Base URL field. Three buttons that
+ * pre-fill `base_url` + `model` (and `helper_model` when the preset
+ * defines one) so curators don't have to remember
+ * `https://openrouter.ai/api/v1` or the Ollama port. Pure UX
+ * scaffolding — Save is still required to persist the choice, and
+ * the API key is never touched.
+ */
+function PresetRow({
+  onPick,
+}: {
+  onPick: (preset: LlmPreset) => void;
+}): React.JSX.Element {
+  return (
+    <div className="grid gap-2">
+      <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+        Quick presets
+      </Label>
+      <div
+        className="flex flex-wrap gap-2"
+        role="group"
+        aria-label="LLM provider presets"
+      >
+        {LLM_PRESETS.map((preset) => {
+          const Icon = PRESET_ICONS[preset.id];
+          return (
+            <Button
+              key={preset.id}
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => onPick(preset)}
+              title={preset.hint}
+              className="gap-1.5"
+            >
+              <Icon className="size-3.5" />
+              {preset.label}
+            </Button>
+          );
+        })}
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Fills the URL and model fields below. Your API key is never
+        changed — paste it after picking the preset (or set{" "}
+        <code className="font-mono">VITE_EPUBLATE_LLM_API_KEY</code>{" "}
+        in <code className="font-mono">.env</code> for a permanent
+        local default).
+      </p>
+    </div>
+  );
+}
+
 function parseTimeoutMs(
   raw: string,
 ): { value: number | null; warning: string | null } {

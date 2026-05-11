@@ -32,6 +32,8 @@
  * into a single pointer at startup.
  */
 
+import { Lru } from "@/lib/lru";
+
 import { TEXT_ENTITY_EXPANSIONS } from "./text_entities";
 
 const PREDEFINED_XML_ENTITIES = new Set(["amp", "lt", "gt", "quot", "apos"]);
@@ -297,17 +299,59 @@ export const XHTML_NAMED_ENTITIES: Record<string, string> = {
 };
 
 /**
+ * Bounded LRU keyed by raw XHTML input. Hits skip the full string
+ * scan, which is meaningful on:
+ *
+ *   - Re-imports of a book the curator imported once before (the same
+ *     chapter bytes pass through this function again).
+ *   - Idle prefetch of an adjacent chapter that the reader then
+ *     actually opens (Tier 3.10 — not yet built; cache is forward-
+ *     compatible).
+ *   - Worker round-trip of a chapter loaded twice in the same session.
+ *
+ * Size cap is deliberately small: each entry holds the source string
+ * *and* its expanded counterpart. For a typical ePub chapter that's
+ * ~200KB × 2 = 400KB, so 16 entries cap memory at roughly 6MB worst-
+ * case. Larger / more chapters than that and we just pay the recompute
+ * cost — which is still fast.
+ *
+ * "Keyed by entity table identity" reduces to "keyed by input" here
+ * because the table (`XHTML_NAMED_ENTITIES`) is a module-scope
+ * constant; if we ever swap tables, the cache must be cleared.
+ */
+const MAX_ENTITY_CACHE_SIZE = 16;
+const entityCache = new Lru<string, string>(MAX_ENTITY_CACHE_SIZE);
+
+/**
  * Replace named entity references in `xml` with their literal Unicode
  * characters. Skips the five XML built-ins (those go straight to the
  * DOMParser as-is). Unknown entities are left intact so the parser can
  * raise a proper error rather than us silently dropping them.
  */
 export function expandNamedEntities(xml: string): string {
-  return xml.replace(ENTITY_REF_RE, (whole, name: string) => {
+  const cached = entityCache.get(xml);
+  if (cached !== undefined) return cached;
+  const expanded = xml.replace(ENTITY_REF_RE, (whole, name: string) => {
     if (PREDEFINED_XML_ENTITIES.has(name)) return whole;
     const value = XHTML_NAMED_ENTITIES[name];
     return value !== undefined ? value : whole;
   });
+  entityCache.set(xml, expanded);
+  return expanded;
+}
+
+/** Test-only: stats hook for benchmarks. */
+export function __getEntityCacheStats(): {
+  hits: number;
+  misses: number;
+  size: number;
+} {
+  return entityCache.stats();
+}
+
+/** Test-only: drop the cache so cross-test state doesn't bleed. */
+export function __resetEntityCacheForTests(): void {
+  entityCache.clear();
 }
 
 /** Re-export the typography subset the segmenter strips at placeholderize-time. */

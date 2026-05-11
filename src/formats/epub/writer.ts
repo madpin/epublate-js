@@ -13,7 +13,7 @@
  *     we know the target language; idempotent on re-export.
  */
 
-import JSZip from "jszip";
+import { zipEpubEntries } from "@/workers/epub.client";
 
 import { type Book } from "./types";
 
@@ -29,14 +29,27 @@ export interface BuildEpubOptions {
   provenance?: string;
 }
 
-async function buildZip(
+/**
+ * Assemble the final entries map for a translated `Book`.
+ *
+ * Returns a `Map<string, Uint8Array | string>` ready to be handed to
+ * the ZIP worker (or the inline fallback). Entries we mutated land as
+ * strings; pass-through binaries stay as `Uint8Array`. The
+ * `mimetype` entry comes first so JSZip can hand it the
+ * STORE-compression flag.
+ *
+ * Pre-serializing XHTML / OPF on the main thread is required because
+ * `XMLSerializer` is not reliably exposed inside a `Worker` scope.
+ * The heavy work — DEFLATE compression — runs in the worker.
+ */
+function assembleEntries(
   book: Book,
   options: BuildEpubOptions,
-): Promise<JSZip> {
-  const zip = new JSZip();
-  zip.file(MIMETYPE_FILENAME, MIMETYPE_VALUE, {
-    compression: "STORE",
-  });
+): Map<string, Uint8Array | string> {
+  const out = new Map<string, Uint8Array | string>();
+  // mimetype must be the first entry per ePub spec; insertion order is
+  // preserved through worker postMessage so we set it first here.
+  out.set(MIMETYPE_FILENAME, MIMETYPE_VALUE);
 
   // Updated entries replace originals byte-for-byte, keyed by zip
   // entry name. Chapters we mutated, plus a possibly-updated OPF.
@@ -66,7 +79,7 @@ async function buildZip(
       // robust across both browser and jsdom. The chapter / OPF bytes
       // we hold are guaranteed UTF-8 because that's what `loadEpub`
       // decoded them as in the first place.
-      zip.file(name, replacement);
+      out.set(name, replacement);
     } else {
       // Pass-through verbatim — copy the bytes into a stand-alone
       // typed array so JSZip doesn't choke on a typed-array view
@@ -76,23 +89,26 @@ async function buildZip(
       // or mangle stylesheets/SVG declared in non-UTF-8 charsets.
       const copy = new Uint8Array(bytes.byteLength);
       copy.set(bytes);
-      zip.file(name, copy);
+      out.set(name, copy);
     }
   }
-  return zip;
+  return out;
 }
 
 export async function buildEpubBlob(
   book: Book,
   options: BuildEpubOptions = {},
 ): Promise<Blob> {
-  const zip = await buildZip(book, options);
-  return zip.generateAsync({
-    type: "blob",
-    mimeType: "application/epub+zip",
-    compression: "DEFLATE",
-    compressionOptions: { level: 6 },
-  });
+  const bytes = await buildEpubBytes(book, options);
+  // Copy into a fresh ArrayBuffer-backed view. The Uint8Array we get
+  // back from the worker is typed as `Uint8Array<ArrayBufferLike>`,
+  // which strict TS lib defs (correctly) reject as a BlobPart because
+  // its backing buffer *could* be a SharedArrayBuffer — Blob doesn't
+  // accept those. The copy is cheap relative to the DEFLATE pass we
+  // just finished and keeps the type system honest.
+  const out = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(out).set(bytes);
+  return new Blob([out], { type: "application/epub+zip" });
 }
 
 /**
@@ -104,12 +120,8 @@ export async function buildEpubBytes(
   book: Book,
   options: BuildEpubOptions = {},
 ): Promise<Uint8Array> {
-  const zip = await buildZip(book, options);
-  return zip.generateAsync({
-    type: "uint8array",
-    compression: "DEFLATE",
-    compressionOptions: { level: 6 },
-  });
+  const entries = assembleEntries(book, options);
+  return zipEpubEntries(entries);
 }
 
 const XML_NS = "http://www.w3.org/XML/1998/namespace";

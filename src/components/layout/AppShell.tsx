@@ -36,6 +36,7 @@
 import * as React from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { useLiveQuery } from "dexie-react-hooks";
+import { toast } from "sonner";
 import {
   ArrowLeft,
   BookOpen,
@@ -103,9 +104,25 @@ export function AppShell(): React.JSX.Element {
   const project_match = location.pathname.match(/^\/project\/([^/]+)/);
   const url_project_id = project_match ? project_match[1] : null;
   const mock_mode = useAppStore((s) => s.mock_mode);
+  const seeded_from_env = useAppStore((s) => s.seeded_from_env);
+  const clearSeededFromEnv = useAppStore((s) => s.clearSeededFromEnv);
   const last_project_id = useLastProjectStore((s) => s.last_project_id);
   const remember_last = useLastProjectStore((s) => s.remember);
   const forget_last = useLastProjectStore((s) => s.forget);
+
+  // One-shot notice on the very first boot where `.env` seeded the
+  // LLM Settings row. Clearing the flag immediately afterwards keeps
+  // the toast from firing again if the curator navigates routes
+  // before the Toaster unmounts.
+  React.useEffect(() => {
+    if (!seeded_from_env) return;
+    toast.info("LLM defaults loaded from .env", {
+      description:
+        "Open Settings → LLM endpoint to review the URL, model, and key, then click Save.",
+      duration: 8_000,
+    });
+    clearSeededFromEnv();
+  }, [seeded_from_env, clearSeededFromEnv]);
 
   // Track the URL's active project so global routes (Settings, Lore
   // Books, Projects list) can still keep the project's nav section

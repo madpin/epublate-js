@@ -1,0 +1,72 @@
+[
+  {
+    "label": "dev",
+    "command": "npm run dev",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "build",
+    "command": "npm run build",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "preview",
+    "command": "npm run preview",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "typecheck",
+    "command": "npm run typecheck",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "lint",
+    "command": "npm run lint",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "test",
+    "command": "npm test",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "test:watch",
+    "command": "npm run test:watch",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "test current file",
+    "command": "npx vitest run $ZED_RELATIVE_FILE",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "test current file (watch)",
+    "command": "npx vitest $ZED_RELATIVE_FILE",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "bench",
+    "command": "npm run bench",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  }
+]

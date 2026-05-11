@@ -40,3 +40,21 @@ honour it.
 - `reassembleChapter` runs the same validators that intake uses. If
   you add a new segment field that affects layout, pipe it through
   `Segment` *and* the validator.
+
+## Workers (ZIP I/O only)
+
+- ZIP decompression / re-compression run in
+  `src/workers/epub.worker.ts`, called via
+  `src/workers/epub.client.ts`. Don't add direct `JSZip.loadAsync` /
+  `zip.generateAsync` calls in the loader / writer — the client has
+  both worker and inline fallbacks already wired.
+- The worker boundary is structured-clone only. Pass `Map<path, …>`
+  with `Uint8Array` / `string` values and `ArrayBuffer`
+  transferables. No DOM nodes, no functions, no class instances.
+- `DOMParser` / `XMLSerializer` stay on the main thread —
+  browser-worker compatibility is unreliable. Only CPU-bound,
+  string/bytes-in / string/bytes-out work belongs in
+  `src/workers/`.
+- The inline fallback path MUST be byte-equivalent to the worker
+  path. The `src/workers/epub.client.test.ts` round-trip is the
+  contract.

@@ -17,6 +17,7 @@ import {
   DEFAULT_UI_PREFS,
   readLlmConfig,
   readUiPrefs,
+  seedLlmConfigIfEmpty,
   writeLlmConfig,
   writeUiPrefs,
 } from "@/db/library";
@@ -26,6 +27,10 @@ import {
   type ThemeIdT,
   THEME_ORDER,
 } from "@/db/schema";
+import {
+  hasLlmEnvDefaults,
+  readLlmEnvDefaults,
+} from "@/lib/env_defaults";
 import { applyPricingOverrides } from "@/llm/pricing";
 
 interface AppStore {
@@ -34,6 +39,14 @@ interface AppStore {
   llm: LibraryLlmConfigRow;
   /** True when `?mock=1` is in the URL or `localStorage.epublate-mock-llm` is set. */
   mock_mode: boolean;
+  /**
+   * `true` the very first time `hydrate()` writes a Dexie LLM row
+   * from `.env` build-time defaults. Components that mount during
+   * the first paint can show a one-shot "loaded LLM defaults from
+   * .env" toast and clear the flag. Stays `false` on every
+   * subsequent boot once the row is persisted.
+   */
+  seeded_from_env: boolean;
   hydrate(): Promise<void>;
   setTheme(theme: ThemeIdT): Promise<void>;
   cycleTheme(): Promise<void>;
@@ -45,6 +58,12 @@ interface AppStore {
     patch: Partial<Omit<LibraryLlmConfigRow, "key">>,
   ): Promise<void>;
   setMockMode(on: boolean): void;
+  /**
+   * Clear the `seeded_from_env` flag after the UI has surfaced the
+   * one-shot notice. Idempotent — calling it when the flag is
+   * already `false` is a no-op.
+   */
+  clearSeededFromEnv(): void;
 }
 
 export const useAppStore = create<AppStore>()((set, get) => ({
@@ -52,12 +71,29 @@ export const useAppStore = create<AppStore>()((set, get) => ({
   ui: DEFAULT_UI_PREFS,
   llm: DEFAULT_LLM_CONFIG,
   mock_mode: detectInitialMockMode(),
+  seeded_from_env: false,
 
   async hydrate() {
-    const [ui, llm] = await Promise.all([readUiPrefs(), readLlmConfig()]);
+    // First-run seed: if no Dexie LLM row exists yet and at least one
+    // VITE_EPUBLATE_LLM_* env var is set, write it into the library
+    // singleton so the Settings card boots pre-filled. Curator-saved
+    // rows always win — see `seedLlmConfigIfEmpty` for the contract.
+    const env_defaults = readLlmEnvDefaults();
+    const seed_outcome = hasLlmEnvDefaults(env_defaults)
+      ? await seedLlmConfigIfEmpty(env_defaults)
+      : { seeded: false, row: null as LibraryLlmConfigRow | null };
+    const [ui, llm] = await Promise.all([
+      readUiPrefs(),
+      seed_outcome.row ? Promise.resolve(seed_outcome.row) : readLlmConfig(),
+    ]);
     applyTheme(ui.theme);
     applyPricingOverrides(llm.pricing_overrides ?? {});
-    set({ ui, llm, ready: true });
+    set({
+      ui,
+      llm,
+      ready: true,
+      seeded_from_env: seed_outcome.seeded,
+    });
   },
 
   async setTheme(theme) {
@@ -92,6 +128,10 @@ export const useAppStore = create<AppStore>()((set, get) => ({
     if (on) localStorage.setItem("epublate-mock-llm", "1");
     else localStorage.removeItem("epublate-mock-llm");
     set({ mock_mode: on });
+  },
+
+  clearSeededFromEnv() {
+    if (get().seeded_from_env) set({ seeded_from_env: false });
   },
 }));
 

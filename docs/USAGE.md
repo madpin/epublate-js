@@ -98,7 +98,7 @@ The first time the service worker activates a sonner toast says "epublate is sav
 
 ### LLM endpoint
 
-![Settings → LLM with a base URL, key, and the green "Connection OK" pill after a successful test](screenshots/12-settings-llm.png)
+![Settings → LLM endpoint card with the new Quick presets row (OpenAI, OpenRouter, Ollama), base URL, API key, translator/helper model fields, and the Save / Test connection buttons](screenshots/12-settings-llm.png)
 
 The LLM card has four important fields:
 
@@ -108,6 +108,14 @@ The LLM card has four important fields:
 | API key           | Stored in IndexedDB on this device only. Use the redact toggle to mask while sharing your screen.    |
 | Translator model  | The chat completion model used for `translate` calls (e.g. `gpt-4o-mini`, `claude-3.5-sonnet`).      |
 | Helper model      | A cheaper model for intake, tone sniff, and pre-pass extraction. Falls back to the translator model. |
+
+Above the fields there's a **Quick presets** row with three buttons:
+
+- **OpenAI** — fills `https://api.openai.com/v1` + `gpt-5-mini` / `gpt-5-nano`.
+- **OpenRouter** — fills `https://openrouter.ai/api/v1` + `openai/gpt-5-mini` / `openai/gpt-5-nano`. Browse other model slugs at [openrouter.ai/models](https://openrouter.ai/models).
+- **Ollama** — fills `http://localhost:11434/v1` + `llama3.2`. No API key needed; remember to start Ollama with `OLLAMA_ORIGINS="http://*,https://*,chrome-extension://*,moz-extension://*"` so the SPA's origin isn't rejected.
+
+Presets only mutate the draft fields; nothing is persisted until you click **Save**, and the API key field is intentionally left untouched. For a permanent local default — so you don't repaste your key into every fresh browser session — copy `.env.example` to `.env` and uncomment the `VITE_EPUBLATE_LLM_*` lines you care about. Those values seed the Dexie LLM row on first run only; once you click Save in Settings, your stored config owns the configuration and `.env` no longer applies. **Don't deploy a public build with `VITE_EPUBLATE_LLM_API_KEY` set — the value is baked into the JS bundle.**
 
 Click **Test connection** before kicking off any work. The button performs a 1-token completion against your endpoint and prints a precise diagnosis:
 

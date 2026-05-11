@@ -51,6 +51,15 @@ A browser-only ePub translation studio that:
    (`src/llm/embeddings/base.ts`) covers the optional retrieval
    layer with the same audit-ledger contract — embedding calls
    write `purpose="embedding"` rows.
+   - **`.env` is first-run bootstrap only.** Build-time
+     `VITE_EPUBLATE_LLM_*` defaults seed an *empty* Dexie LLM row
+     on first hydrate via `seedLlmConfigIfEmpty` (see
+     `src/lib/env_defaults.ts` + `src/state/app.ts`). Curator-saved
+     rows always win — env values never silently overwrite or
+     re-seed an existing config. The `VITE_EPUBLATE_LLM_API_KEY`
+     variable is convenient for local dev / single-user deploys but
+     is baked into the JS bundle; the `.env.example` file is the
+     canonical place this warning lives.
 5. **Resumability.** Every batch operation writes durable per-segment
    state. Closing the tab is harmless: opening the project again resumes
    from `pending`/`flagged` segments.
@@ -71,7 +80,10 @@ A browser-only ePub translation studio that:
 | `src/llm/*`           | `epublate.llm.*`                    | Provider, prompts, factory, pricing  |
 | `src/glossary/*`      | `epublate.glossary.*`               | Matcher, enforcer, normalizer        |
 | `src/lore/*`          | `epublate.lore.*`                   | Lore Book CRUD + ingest              |
-| `src/workers/*`       | (none — Python ran in-process)      | Web Workers for off-main parsing     |
+| `src/lib/lru.ts`      | (no Python equivalent)              | Generic LRU cache utility            |
+| `src/lib/throttle.ts` | (no Python equivalent)              | Cooperative async throttle (adaptive concurrency) |
+| `src/lib/env_defaults.ts` | (no Python equivalent)          | Build-time `.env` LLM defaults + Settings presets |
+| `src/workers/*`       | (none — Python ran in-process)      | Web Workers for off-main parsing & ZIP I/O |
 | `src/state/*`         | `epublate.app.state`                | Zustand stores                       |
 | `src/components/*`    | `epublate.app.screens`              | UI screens & layout                  |
 | `src/core/export.ts`  | `epublate.core.export` (new)        | Build translated ePub from segments  |
@@ -84,6 +96,39 @@ A browser-only ePub translation studio that:
 - `@testing-library/react` for component tests; snapshot baselines on
   the seven primary screens land in P6.
 - `fake-indexeddb` is the Vitest backend for any DB-touching test.
+- `tools/bench.ts` (run via `npm run bench`) is the synthetic
+  end-to-end benchmark over `docs/petitprince.epub`. It runs against
+  the deterministic `MockProvider` and prints wall-clock + matcher /
+  entity-cache counters. CI should treat numbers as ratios against a
+  rolling baseline, not absolute thresholds.
+
+## Performance & scale playbook
+
+A handful of always-on optimisations live under the worker /
+utility boundary so they're invisible to callers:
+
+- **Glossary matcher regex cache.** `src/glossary/matcher.ts` caches
+  compiled `RegExp` instances in a module-scoped `Lru` keyed by the
+  joined-and-cleaned term list. Two passes over an unchanged
+  glossary compile every pattern exactly once.
+- **Pre-parse entity-expansion cache.** `src/formats/epub/entities.ts`
+  memoises XHTML entity rewrites for identical input strings so
+  chapter reloads pay the scan cost at most once.
+- **ZIP I/O off the main thread.** `src/workers/epub.worker.ts` runs
+  JSZip decompression and re-compression in a Web Worker, with a
+  transparent inline fallback for environments without `Worker`
+  support (jsdom, niche browsers). `loader.ts` and `writer.ts` go
+  through `src/workers/epub.client.ts`. DOM parsing stays on the
+  main thread because `DOMParser` / `XMLSerializer` aren't reliably
+  available in workers.
+- **Adaptive batch concurrency.** `src/core/batch.ts` reads
+  `provider.getRateLimitHint()` after every successful call and
+  attenuates a shared `Throttle` so the effective in-flight count
+  never exceeds half of `x-ratelimit-remaining-requests`, floored
+  at 1 and capped at the curator's configured concurrency. Each
+  transition writes a `batch.concurrency_adjusted` audit event. The
+  policy degrades cleanly to a no-op for providers that don't
+  expose rate-limit headers (mock, raw Ollama, llama.cpp).
 
 ## Style & UX commitments
 

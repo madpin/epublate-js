@@ -170,7 +170,13 @@ src/
 ├── components/              shadcn-style primitives + form modals + layout
 ├── state/                   Zustand stores (no global EventBus, no context soup)
 ├── hooks/                   small composables (useRunBatch, useFormShortcuts, …)
+├── workers/                 off-main-thread CPU work + transparent fallbacks
+│   ├── epub.worker.ts       JSZip decompress/compress in a dedicated worker
+│   └── epub.client.ts       main-thread client with inline JSZip fallback
 └── lib/                     pure utilities (id, hash, time, languages, log buffer)
+    ├── lru.ts               generic Lru<K,V> cache (size + hit/miss stats)
+    ├── throttle.ts          cooperative async throttle with a mutable cap
+    └── env_defaults.ts      VITE_EPUBLATE_LLM_* readers + Settings preset table
 ```
 
 The split is deliberate: `core/` orchestrates, `db/` persists, `formats/` parses, `llm/` calls out, `glossary/` enforces, `lore/` cross-projects, and the React tree (`routes/`, `components/`, `hooks/`, `state/`) only ever consumes those primitives. No screen reaches past `db/repo/*` into Dexie directly; no module under `core/` knows the URL it's running on.
@@ -418,10 +424,20 @@ The callback trio (`on_progress` / `on_segment_start` / `on_segment_end`) is wha
 
 ### The four hard rules
 
-1. **Concurrency cap.** Defaults to 1; user-configurable (typically 4). The pool is a sliding-window of `Promise.all(workers.map(worker))` — each worker pulls the next segment off the cursor until empty/budget/cancel.
+1. **Concurrency cap.** Defaults to 1; user-configurable (typically 4). The pool is a sliding-window of `Promise.all(workers.map(worker))` — each worker pulls the next segment off the cursor until empty/budget/cancel. A shared `Throttle` (`src/lib/throttle.ts`) gates the workers so the *effective* in-flight count can adapt below the configured ceiling — see "Adaptive concurrency from rate-limit headers" below.
 2. **Budget cap.** `effective_budget` is taken from the call's `options.budget_usd ?? project.budget_usd`. After every successful translation we compare `summary.cost_usd` to `effective_budget`; the moment we cross, we set `paused = true` and drain the in-flight workers.
 3. **Failure isolation.** Per-segment failures are caught inside the worker, recorded as `batch.segment_failed` events, and added to `summary.failures`. They never abort the batch.
 4. **Cancellation.** The `AbortSignal` is checked between worker iterations and propagated to the LLM call so `fetch` aborts promptly. The runner throws `BatchCancelled` (carrying the partial summary).
+
+### Adaptive concurrency from rate-limit headers
+
+The runner does not statically pin in-flight count to the curator's configured `concurrency`. Instead each worker acquires a slot from a shared `Throttle` whose cap is recomputed after every successful call from the provider's `getRateLimitHint()`:
+
+- After `translateSegment` returns, the worker calls `provider.getRateLimitHint?.()`. The `OpenAICompatProvider` returns its last sampled `x-ratelimit-remaining-requests` / `-tokens` / `-reset-*` snapshot (see `parseRateLimitHeaders` in `src/llm/openai_compat.ts`). Mock and raw providers return `null`.
+- `deriveConcurrencyCap(configured, hint)` (exported from `src/core/batch.ts`) picks the effective cap. Policy: `min(configured, floor(remaining_requests / 2))`, clamped to `[1, configured]`. The `÷2` is a deliberate "leave half the window for someone else" safety factor so a brief co-tenant spike doesn't push the next call into a 429. We never amplify beyond the curator's chosen value and we always make forward progress (floor = 1).
+- When the effective cap changes, the worker calls `throttle.setCap(newCap)`. Raising the cap wakes parked acquirers up to the new ceiling; lowering it is enforced lazily as in-flight work completes (no preemption).
+- Every transition writes a `batch.concurrency_adjusted` audit event with `{from, to, configured, remaining_requests, remaining_tokens, reset_requests_ms}`. The Activity log surfaces these so curators see exactly why a batch slowed down.
+- Providers without rate-limit headers are a no-op: `getRateLimitHint()` returns `null`, the cap stays at `configured`, and the throttle gate adds no measurable wall-clock — identical behaviour to the pre-throttle code path.
 
 ### Resilience layer (per-segment retry + circuit breaker)
 
@@ -470,6 +486,8 @@ The glossary is what makes long-form translation tractable. There are five sub-m
 
 `findMentions(source, entries)` returns spans in source order. The pipeline calls this *after* a successful translation to record one `entity_mentions` row per (segment, entry) pair — that's how the Glossary screen's "Occurrences" list knows where each entry appears.
 
+**Compiled-regex cache.** `makePattern` is the matcher's hot loop: every segment runs it both before the LLM call (to build prompt constraints) and after (to validate the response). A module-scoped `Lru<string, RegExp>` (`src/lib/lru.ts`) memoises every distinct alphabetically-sorted, deduplicated term list, so a stable glossary compiles each entry's regex exactly once across the entire batch. The cache exposes telemetry via `__getMatcherStats()` (compile count + hit count) for the synthetic benchmark and tests; the LRU bound is `MAX_CACHE_SIZE = 4096` patterns. Two passes over an unchanged 2k-entry glossary go from "2k compiles per call" to "2k total".
+
 ### Enforcement
 
 `buildConstraints(entries)` is the pure projection that produces the prompt's constraint block. It excludes proposed entries (the LLM should not be locked to an unvetted suggestion) and it sorts deterministically (locked first, then confirmed; alphabetical within each bucket). Identical glossaries always produce identical prompts, which is what makes the cache key stable.
@@ -512,6 +530,16 @@ flowchart LR
   segments --> pipeline --> segments
   segments --> reassembly --> book --> writer --> out
 ```
+
+### Workers (`workers/epub.worker.ts` + `workers/epub.client.ts`)
+
+ePub intake and export shuffle bytes through `JSZip`, which is the single most expensive synchronous step in the whole pipeline for multi-MB books. We offload it to a dedicated Web Worker:
+
+- `epub.worker.ts` exposes two request types: `unzip` (bytes → `Map<path, Uint8Array>`) and `zip` (`Map<path, Uint8Array | string>` → bytes). Replies use `ArrayBuffer` transferables to avoid a structured-clone copy on the way back.
+- `epub.client.ts` is the main-thread façade. It lazily constructs a worker per call and terminates it after settle, so the worker pool never grows past 1 simultaneous task. If `Worker` isn't supported (jsdom, niche browsers) or worker construction throws, the client falls back to the same `JSZip` calls inline — byte-equivalent output, just on the main thread.
+- DOM parsing stays on the main thread. `DOMParser` / `XMLSerializer` aren't reliably available in workers across browsers, and a separate worker for "parse this string of XHTML I already have in main-thread memory" doesn't buy enough to justify the IPC.
+
+The loader (`formats/epub/loader.ts`) and writer (`formats/epub/writer.ts`) call into the client without knowing whether the work happened on or off the main thread. Round-trip property tests in `formats/epub/loader_writer.test.ts` cover both paths.
 
 ### Loader (`formats/epub/loader.ts`)
 
@@ -562,6 +590,11 @@ Every LLM call goes through `LLMProvider`:
 interface LLMProvider {
   readonly name: string;
   chat(request: ChatRequest): Promise<ChatResult>;
+  /**
+   * Optional: most recent `x-ratelimit-*` snapshot from a 2xx
+   * response. Read by `src/core/batch.ts` to attenuate concurrency.
+   */
+  getRateLimitHint?(): RateLimitHint | null;
 }
 ```
 
@@ -572,6 +605,7 @@ Two concrete implementations. The factory at `src/llm/factory.ts` decides which 
 Speaks `/v1/chat/completions`. Works against OpenAI, Azure OpenAI, OpenRouter, Together, Groq, DeepInfra, Ollama (relaunched with `OLLAMA_ORIGINS="http://*,https://*,chrome-extension://*,moz-extension://*"` — the bare `*` shorthand is parsed inconsistently across Ollama releases), vLLM, and llama.cpp. The browser-specific scaffolding:
 
 - **Retry loop with full-jitter exponential backoff.** Same retry semantics as the Python tool: respects `Retry-After` and `X-RateLimit-Reset` headers up to a `RATE_LIMIT_SHORT_WAIT_CAP_SECONDS = 120` ceiling, then surfaces a typed `LLMRateLimitError` so the orchestrator can pause cleanly.
+- **Rate-limit hint sampling.** On every 2xx the provider snapshots `x-ratelimit-remaining-requests` / `-tokens` / `-reset-*` into `lastRateLimitHint` via `parseRateLimitHeaders`. The batch runner reads this through `getRateLimitHint()` after each call and shrinks the worker pool's `Throttle` when the upstream window is tight — see [Adaptive concurrency from rate-limit headers](#adaptive-concurrency-from-rate-limit-headers). Providers without these headers fall back to "no hint" → no attenuation, identical to the static-concurrency path.
 - **CORS-aware error mapping.** Browser-side, a CORS rejection comes through as a generic `TypeError`. We catch it and re-throw as `LLMError("network error")` with a hint pointing at the Settings docs.
 - **Configurable per-request timeout with curator-friendly abort copy.** The provider takes a `timeout_ms` (default **120 000 ms**, library/project overridable through `resolveLlmConfig`). Internally it wraps the user-supplied `AbortSignal` with `AbortSignal.any` plus a `setTimeout` that calls `controller.abort(new DOMException("Request timed out after Xs", "TimeoutError"))`. When the call surfaces as a `network error: signal is aborted without reason` we now know whether the abort came from the user (cancel button), a real network failure, or our own timer — and we re-throw with `"timed out after Xs while talking to <url> — increase Request timeout in Settings → LLM, or disable thinking on the model"` so the curator gets actionable advice. See `OpenAICompatProvider.chat`.
 - **API key never echoed back.** The audit log's `request_json` is built from our own `Message` array, not from the wire payload — so even `?debug=true` query strings can't leak the key.
@@ -585,6 +619,23 @@ Deterministic, no-network. Returns `[mock-tr] <source_text>` verbatim, with a sy
 - The `?mock=1` URL toggle.
 - The `Mock LLM mode` switch in Settings.
 - Every test in the suite (the pipeline and the batch runner are exercised against the mock; `openai_compat.test.ts` exercises the HTTP flow against a `vi.spyOn(globalThis, "fetch")` fake).
+
+### Build-time `.env` defaults and Settings presets
+
+`src/lib/env_defaults.ts` exposes two small surfaces that keep the LLM Settings card painless to set up:
+
+- **`readLlmEnvDefaults(source?)`** reads `VITE_EPUBLATE_LLM_BASE_URL` / `_API_KEY` / `_MODEL` / `_HELPER_MODEL` / `_ORGANIZATION` / `_REASONING_EFFORT` / `_TIMEOUT_MS` and returns a `Partial<LibraryLlmConfigRow>`. Empty / whitespace / non-parsing values are dropped (not nulled) so the caller can spread the partial without clobbering hard-coded defaults. `readLlmEnvDefaults` accepts an explicit `source` map so unit tests don't have to fight Vite's static `import.meta.env` capture.
+- **`LLM_PRESETS`** ships the three quick-preset rows surfaced above the Base URL field in the LLM card (OpenAI, OpenRouter, Ollama). Each preset carries a stable `id`, a base URL, a translator model slug, an optional helper-model slug, and a one-line tooltip. Preset buttons only mutate the form drafts — the API key field is intentionally left alone and persistence still happens through the existing Save button.
+
+The seeding rule lives in `state/app.ts → hydrate()` and `db/library.ts → seedLlmConfigIfEmpty()`:
+
+1. On every hydrate, the app store calls `readLlmEnvDefaults()` once. If the result has at least one key, it calls `seedLlmConfigIfEmpty(partial)`.
+2. `seedLlmConfigIfEmpty` does a direct `libraryDb().llm.get("llm")`. If a row already exists, it returns `{ seeded: false }` and the env partial is ignored. Otherwise it writes a single row that merges `DEFAULT_LLM_CONFIG` with the env partial and returns `{ seeded: true }`.
+3. `AppShell` listens for `seeded_from_env === true` and fires a one-shot info toast that points curators at Settings → LLM endpoint.
+
+Curator state always wins. Once any value has been saved via the Settings card, env defaults stop influencing the configuration; the only way to re-seed is to clear the Dexie row (Settings → Reset all data, or DevTools → Application → IndexedDB).
+
+`VITE_EPUBLATE_LLM_API_KEY` is captured at build time and baked into the JS bundle as a string literal. For local dev / single-user deploys against a private endpoint this is fine; for public deploys it's a credential leak. The `.env.example` file is the canonical place this warning lives — every value there is commented out by default and the file ships with a per-provider snippet block (OpenAI, OpenRouter, Ollama).
 
 ### Translator prompts
 
@@ -920,8 +971,11 @@ The test suite is split along the same module boundaries as the source. Each mod
 | **Property-based**  | `formats/epub/segmentation.test.ts`                 | `fast-check`                      |
 | **DOM / component** | `components/layout/CheatSheet.test.tsx`             | `@testing-library/react` + jsdom  |
 | **Round-trip ePub** | `formats/epub/petitprince_reader.test.ts`           | jsdom + `tests/fixtures/*.epub`   |
+| **Synthetic bench** | `tools/bench.ts` (run via `npm run bench`)          | jsdom + `fake-indexeddb` (Vitest) |
 
 Run with `npm run test`. The whole suite is hermetic — no network, no real LLM, no real filesystem mutations beyond the testing temp dirs Vitest manages.
+
+The bench is opt-in (`npm run bench`) and drives the full intake → batch pipeline over `docs/petitprince.epub` against the deterministic `MockProvider`. It prints wall-clock for `intake_ms` / `batch_ms`, segment counts, matcher cache compiles + hits, and entity-cache misses + hits. Wall-clock isn't comparable across machines — CI should treat numbers as ratios against a rolling baseline, not absolute thresholds.
 
 The two non-obvious ones:
 

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 
 import type { GlossaryEntryWithAliases } from "@/glossary/models";
 import {
@@ -19,7 +19,13 @@ import {
   validateTarget,
 } from "@/glossary/enforcer";
 import { exportCsv, parseCsv } from "@/glossary/io";
-import { makePattern, matchSource, targetUses } from "@/glossary/matcher";
+import {
+  __getMatcherStats,
+  __resetMatcherCacheForTests,
+  makePattern,
+  matchSource,
+  targetUses,
+} from "@/glossary/matcher";
 import {
   analyzePair,
   findDoubledParticles,
@@ -165,6 +171,100 @@ describe("matcher.matchSource", () => {
   it("respects word boundaries", () => {
     const out = matchSource("Elise was elsewhere.", [eli]);
     expect(out).toHaveLength(0);
+  });
+});
+
+describe("matcher.makePattern cache", () => {
+  // Reset before each assertion so we can read clean counters. The
+  // cache is module-scope and survives across tests by design — these
+  // checks rely on the reset hook to keep their accounting honest.
+  beforeEach(() => {
+    __resetMatcherCacheForTests();
+  });
+
+  it("compiles a regex only on the first call for identical input", () => {
+    const terms = ["alpha", "beta", "gamma"];
+    const r1 = makePattern(terms);
+    const r2 = makePattern(terms);
+    const r3 = makePattern([...terms]); // different array, same content
+    // Same shared `RegExp` instance handed back on each hit.
+    expect(r1).toBe(r2);
+    expect(r2).toBe(r3);
+    const stats = __getMatcherStats();
+    expect(stats.compile_count).toBe(1);
+    expect(stats.cache_hit_count).toBe(2);
+  });
+
+  it("normalizes term order + duplicates so calls with the same set share a regex", () => {
+    const a = makePattern(["alpha", "beta"]);
+    const b = makePattern(["beta", "alpha"]);
+    const c = makePattern(["alpha", "alpha", "beta"]);
+    expect(a).toBe(b);
+    expect(b).toBe(c);
+    expect(__getMatcherStats().compile_count).toBe(1);
+  });
+
+  it("compiles distinct regexes for different term sets", () => {
+    const a = makePattern(["one"]);
+    const b = makePattern(["two"]);
+    expect(a).not.toBe(b);
+    expect(__getMatcherStats().compile_count).toBe(2);
+  });
+
+  it("does not cache the empty case", () => {
+    expect(makePattern([])).toBeNull();
+    expect(makePattern([""])).toBeNull();
+    expect(__getMatcherStats().compile_count).toBe(0);
+    expect(__getMatcherStats().cache_hit_count).toBe(0);
+  });
+
+  it("matchSource over a many-entry glossary compiles each entry's pattern exactly once across two passes", () => {
+    // Simulate the pipeline's hot loop: pre-call constraints + post-
+    // call validation run `matchSource` twice per segment over the
+    // full project glossary. Without the cache we'd see N compiles
+    // on the first pass and N more on the second. With the cache we
+    // see N compiles total and N hits on the second pass.
+    const entries: GlossaryEntryWithAliases[] = [];
+    for (let i = 0; i < 50; i += 1) {
+      entries.push(
+        fakeEntry({
+          id: `e-${i}`,
+          source_term: `Term${i}`,
+          target_term: `t${i}`,
+        }),
+      );
+    }
+    matchSource("nothing matches here", entries);
+    expect(__getMatcherStats().compile_count).toBe(50);
+    expect(__getMatcherStats().cache_hit_count).toBe(0);
+    // Second pass over the same glossary — every entry hits the cache.
+    matchSource("still nothing matches", entries);
+    expect(__getMatcherStats().compile_count).toBe(50);
+    expect(__getMatcherStats().cache_hit_count).toBe(50);
+  });
+
+  it("targetUses hits the same cache (shared key space) when source aliases happen to coincide", () => {
+    const ent = fakeEntry({
+      source_term: "Câmara",
+      target_term: "Câmara",
+    });
+    matchSource("A Câmara votou.", [ent]); // compiles for ["Câmara"]
+    targetUses("A Câmara votou.", ent); // same canonical key
+    const stats = __getMatcherStats();
+    expect(stats.compile_count).toBe(1);
+    expect(stats.cache_hit_count).toBeGreaterThanOrEqual(1);
+  });
+
+  it("preserves longest-first / Unicode-boundary semantics on a cache hit", () => {
+    // Confirm we're returning the same `RegExp` *and* it still
+    // honours the original semantics — paranoia against a refactor
+    // that ever drops the length-desc sort.
+    const re1 = makePattern(["Eli", "Elise"])!;
+    const re2 = makePattern(["Eli", "Elise"])!;
+    expect(re1).toBe(re2);
+    re1.lastIndex = 0;
+    const m = re1.exec("Elise stood, Eli waved.")!;
+    expect(m[0]).toBe("Elise");
   });
 });
 

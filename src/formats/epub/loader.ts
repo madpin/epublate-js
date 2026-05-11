@@ -17,7 +17,7 @@
  *     other non-translatable assets.
  */
 
-import JSZip from "jszip";
+import { unzipEpubBytes } from "@/workers/epub.client";
 
 import { expandNamedEntities } from "./entities";
 import {
@@ -48,16 +48,11 @@ export async function loadEpub(
   bytes: ArrayBuffer | Uint8Array,
   options: { filename?: string } = {},
 ): Promise<Book> {
-  const zip = await JSZip.loadAsync(bytes);
-
-  const entries = new Map<string, Uint8Array>();
-  await Promise.all(
-    Object.values(zip.files).map(async (entry) => {
-      if (entry.dir) return;
-      const data = await entry.async("uint8array");
-      entries.set(entry.name, data);
-    }),
-  );
+  // ZIP decompression goes through a Web Worker when available (see
+  // `src/workers/epub.client.ts`). The fallback path runs JSZip on the
+  // main thread and is byte-equivalent, so round-trip tests behave
+  // identically in either mode.
+  const entries = await unzipEpubBytes(bytes);
 
   const containerBytes = entries.get("META-INF/container.xml");
   if (!containerBytes) {

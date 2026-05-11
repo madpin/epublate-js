@@ -58,11 +58,51 @@ export interface ChatResult {
   duration_ms?: number | null;
 }
 
+/**
+ * Provider rate-limit hint, sampled from response headers on a
+ * successful call. Used by `src/core/batch.ts` to attenuate the
+ * worker pool when the upstream is approaching its quota.
+ *
+ * All fields are `null` when the provider didn't expose that header.
+ * Concrete shapes:
+ *
+ * - OpenAI / Anthropic / Mistral emit `x-ratelimit-remaining-requests`
+ *   and `x-ratelimit-remaining-tokens` as integers.
+ * - `x-ratelimit-reset-requests` is an ISO duration or seconds —
+ *   we normalize to "milliseconds until reset".
+ * - `Retry-After` on 4xx/5xx is captured separately and surfaced via
+ *   the typed `LLMRateLimitError` (not here).
+ *
+ * Future signals (Anthropic's `anthropic-ratelimit-input-tokens-*`,
+ * Vertex's `quota-project-*`) can slot in without breaking the
+ * struct shape — readers MUST cope with `null` everywhere.
+ */
+export interface RateLimitHint {
+  /** Requests remaining in the current quota window. */
+  remaining_requests: number | null;
+  /** Input/output tokens remaining in the current quota window. */
+  remaining_tokens: number | null;
+  /** Milliseconds until the request window resets, or null. */
+  reset_requests_ms: number | null;
+  /** Milliseconds until the token window resets, or null. */
+  reset_tokens_ms: number | null;
+  /** `performance.now()` when this hint was sampled. */
+  observed_at: number;
+}
+
 export interface LLMProvider {
   /** Provider-shape identifier surfaced in the audit table. */
   readonly name: string;
 
   chat(request: ChatRequest): Promise<ChatResult>;
+
+  /**
+   * Most recent rate-limit hint observed by this provider, if any.
+   * Optional: providers without rate-limit headers (mock, raw local
+   * endpoints) need not implement. Returns `null` when nothing has
+   * been observed yet.
+   */
+  getRateLimitHint?(): RateLimitHint | null;
 }
 
 /** Errors the pipeline knows how to react to. */

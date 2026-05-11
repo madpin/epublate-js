@@ -4,6 +4,8 @@ import { LLMError } from "@/llm/base";
 import {
   explainFetchFailure,
   OpenAICompatProvider,
+  parseRateLimitDuration,
+  parseRateLimitHeaders,
 } from "@/llm/openai_compat";
 
 describe("OpenAICompatProvider header hardening", () => {
@@ -465,5 +467,184 @@ describe("OpenAICompatProvider header hardening", () => {
         value: original,
       });
     }
+  });
+});
+
+describe("parseRateLimitDuration", () => {
+  it("returns null for empty / missing values", () => {
+    expect(parseRateLimitDuration(null)).toBeNull();
+    expect(parseRateLimitDuration("")).toBeNull();
+    expect(parseRateLimitDuration("   ")).toBeNull();
+  });
+
+  it("treats a bare number as seconds", () => {
+    expect(parseRateLimitDuration("60")).toBe(60_000);
+    expect(parseRateLimitDuration("0")).toBe(0);
+    expect(parseRateLimitDuration("0.5")).toBe(500);
+  });
+
+  it("parses 's' / 'm' / 'h' suffixes", () => {
+    expect(parseRateLimitDuration("60s")).toBe(60_000);
+    expect(parseRateLimitDuration("1.5s")).toBe(1500);
+    expect(parseRateLimitDuration("6m0s")).toBe(360_000);
+    expect(parseRateLimitDuration("2h30m")).toBe(2 * 3_600_000 + 30 * 60_000);
+  });
+
+  it("parses 'ms' before 'm|s' in alternation", () => {
+    expect(parseRateLimitDuration("250ms")).toBe(250);
+    expect(parseRateLimitDuration("1s250ms")).toBe(1250);
+  });
+
+  it("returns null for garbage", () => {
+    expect(parseRateLimitDuration("nope")).toBeNull();
+    expect(parseRateLimitDuration("--")).toBeNull();
+  });
+});
+
+describe("parseRateLimitHeaders", () => {
+  it("returns null when no x-ratelimit-* headers are present", () => {
+    expect(parseRateLimitHeaders(new Headers())).toBeNull();
+    expect(
+      parseRateLimitHeaders(new Headers({ "content-type": "text/plain" })),
+    ).toBeNull();
+  });
+
+  it("samples remaining-requests / remaining-tokens as integers", () => {
+    const hint = parseRateLimitHeaders(
+      new Headers({
+        "x-ratelimit-remaining-requests": "42",
+        "x-ratelimit-remaining-tokens": "1000",
+      }),
+    );
+    expect(hint).not.toBeNull();
+    expect(hint!.remaining_requests).toBe(42);
+    expect(hint!.remaining_tokens).toBe(1000);
+    expect(hint!.reset_requests_ms).toBeNull();
+    expect(hint!.reset_tokens_ms).toBeNull();
+    expect(typeof hint!.observed_at).toBe("number");
+  });
+
+  it("converts x-ratelimit-reset-* to milliseconds", () => {
+    const hint = parseRateLimitHeaders(
+      new Headers({
+        "x-ratelimit-reset-requests": "6m0s",
+        "x-ratelimit-reset-tokens": "1.5s",
+      }),
+    );
+    expect(hint).not.toBeNull();
+    expect(hint!.reset_requests_ms).toBe(360_000);
+    expect(hint!.reset_tokens_ms).toBe(1500);
+  });
+
+  it("partial headers → partial hint, missing fields are null", () => {
+    const hint = parseRateLimitHeaders(
+      new Headers({ "x-ratelimit-remaining-requests": "5" }),
+    );
+    expect(hint).not.toBeNull();
+    expect(hint!.remaining_requests).toBe(5);
+    expect(hint!.remaining_tokens).toBeNull();
+    expect(hint!.reset_requests_ms).toBeNull();
+    expect(hint!.reset_tokens_ms).toBeNull();
+  });
+});
+
+describe("OpenAICompatProvider.getRateLimitHint", () => {
+  it("captures the most recent x-ratelimit-* response headers", async () => {
+    let callIdx = 0;
+    const fetchImpl: typeof fetch = vi.fn(async () => {
+      callIdx += 1;
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: "ok" } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+          model: "test-model",
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "x-ratelimit-remaining-requests": String(100 - callIdx),
+            "x-ratelimit-remaining-tokens": String(10000 - callIdx * 10),
+            "x-ratelimit-reset-requests": "60s",
+            "x-ratelimit-reset-tokens": "30s",
+          },
+        },
+      );
+    });
+    const provider = new OpenAICompatProvider({
+      base_url: "https://example.com/v1",
+      api_key: "sk-test",
+      default_model: "test-model",
+      retry_policy: { max_retries: 0 },
+      fetchImpl,
+    });
+    expect(provider.getRateLimitHint()).toBeNull();
+    await provider.chat({
+      model: "test-model",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const first = provider.getRateLimitHint();
+    expect(first).not.toBeNull();
+    expect(first!.remaining_requests).toBe(99);
+    expect(first!.reset_requests_ms).toBe(60_000);
+    await provider.chat({
+      model: "test-model",
+      messages: [{ role: "user", content: "again" }],
+    });
+    const second = provider.getRateLimitHint();
+    expect(second).not.toBeNull();
+    expect(second!.remaining_requests).toBe(98);
+  });
+
+  it("leaves the cached hint untouched when the provider omits headers", async () => {
+    const fetchImpl: typeof fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "ok" } }],
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+            model: "test-model",
+          }),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              "x-ratelimit-remaining-requests": "10",
+            },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "again" } }],
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+            model: "test-model",
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" }, // no rate-limit headers
+          },
+        ),
+      );
+    const provider = new OpenAICompatProvider({
+      base_url: "https://example.com/v1",
+      api_key: "sk-test",
+      default_model: "test-model",
+      retry_policy: { max_retries: 0 },
+      fetchImpl,
+    });
+    await provider.chat({
+      model: "test-model",
+      messages: [{ role: "user", content: "1" }],
+    });
+    expect(provider.getRateLimitHint()!.remaining_requests).toBe(10);
+    await provider.chat({
+      model: "test-model",
+      messages: [{ role: "user", content: "2" }],
+    });
+    // Sticky: a header-less response doesn't clear a previously good hint.
+    expect(provider.getRateLimitHint()!.remaining_requests).toBe(10);
   });
 });

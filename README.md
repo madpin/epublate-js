@@ -96,7 +96,7 @@ npm run dev                  # http://localhost:5173
 
 Then:
 
-1. Visit **Settings → LLM**, paste an OpenAI-compatible base URL + key, hit "Test connection". (Or skip this and append `?mock=1` to the URL for the deterministic mock provider — see the screenshot below.)
+1. Visit **Settings → LLM**. Three "Quick presets" buttons (OpenAI, OpenRouter, Ollama) pre-fill the base URL + model in one click — paste your key, then hit "Test connection". (Or skip the LLM step entirely and append `?mock=1` to the URL for the deterministic mock provider — see the screenshot below.)
 2. From the **Projects** landing page, drop an ePub onto the dropzone or click "New project". Pick source / target language and a style preset.
 3. The **Dashboard** opens. Click "Translate batch" to run the helper-LLM pre-pass, then translate every pending segment with bounded concurrency and a budget cap. Or open the **Reader**, focus a segment, and press `t` to translate just that one.
 4. **Glossary** picks up proposed entries from the helper LLM and from the translator's `new_entities` field on every successful call. Approve or lock the ones you care about.
@@ -116,6 +116,21 @@ For a deeper walk-through, see [**docs/USAGE.md**](docs/USAGE.md). The same tour
 ```bash
 open "http://localhost:5173/?mock=1"
 ```
+
+### Pre-fill the LLM config from `.env`
+
+Copy `.env.example` to `.env` (or `.env.local`) and uncomment the values you want pre-filled in **Settings → LLM endpoint** on first run:
+
+```bash
+cp .env.example .env
+# Edit .env — supports VITE_EPUBLATE_LLM_BASE_URL, _API_KEY, _MODEL,
+# _HELPER_MODEL, _REASONING_EFFORT, _TIMEOUT_MS, _ORGANIZATION.
+npm run dev
+```
+
+These values are read at build time and **baked into the bundle**. They seed the Dexie LLM row the first time the app boots on a device; once you click Save in Settings, the persisted row owns the configuration. Curator state always wins — `.env` never silently overrides a saved value.
+
+⚠️ Don't deploy a public build with `VITE_EPUBLATE_LLM_API_KEY` set — it ships inside the JavaScript bundle. For shared deployments, leave it blank and let each curator paste their own key into Settings (where it lives only in their browser's IndexedDB). See `.env.example` for the full reference and the per-provider snippet block.
 
 ---
 

@@ -29,6 +29,7 @@ import {
   type ChatResult,
   type LLMProvider,
   type Message,
+  type RateLimitHint,
   type ResponseFormat,
   LLMError,
   LLMHttpError,
@@ -183,6 +184,14 @@ export class OpenAICompatProvider implements LLMProvider {
     ms: number,
     signal?: AbortSignal,
   ) => Promise<void>;
+  /**
+   * Most recent rate-limit hint sampled from a 2xx response. Mutable
+   * state on the provider instance — safe here because a single
+   * provider serves a single curator's batch at a time. Consumers
+   * read it via `getRateLimitHint()` and apply their own attenuation
+   * policy (see `src/core/batch.ts`).
+   */
+  private lastRateLimitHint: RateLimitHint | null = null;
 
   constructor(options: OpenAICompatProviderOptions) {
     if (!options.base_url || !options.base_url.trim()) {
@@ -348,6 +357,12 @@ export class OpenAICompatProvider implements LLMProvider {
       request.signal?.removeEventListener("abort", onOuterAbort);
 
       if (response.ok) {
+        // Sample x-ratelimit-* before we hand the body off — the
+        // batch runner uses this on the *next* call to size its
+        // concurrency window, so a stale hint is worse than a
+        // missing one.
+        const hint = parseRateLimitHeaders(response.headers);
+        if (hint) this.lastRateLimitHint = hint;
         const json = (await response.json()) as ChatCompletionPayload;
         const result = parseCompletion(json, model, request.messages);
         result.duration_ms = nowMillis() - t0;
@@ -403,6 +418,11 @@ export class OpenAICompatProvider implements LLMProvider {
     throw new LLMError(
       `retry loop exited without a result (last error: ${lastErr})`,
     );
+  }
+
+  /** Last `x-ratelimit-*` snapshot, or `null` if none observed yet. */
+  getRateLimitHint(): RateLimitHint | null {
+    return this.lastRateLimitHint;
   }
 
   private headers(): Record<string, string> {
@@ -489,6 +509,97 @@ function parseCompletion(
     model: payload.model || fallback_model,
     cache_hit: false,
     raw: payload,
+  };
+}
+
+/**
+ * Parse an OpenAI-style rate-limit duration to milliseconds.
+ *
+ * The wire format is bizarrely loose: `"60s"`, `"6m0s"`, `"1.5s"`,
+ * `"10ms"`, and bare-number "seconds" all occur in the wild. We
+ * accept all of them and return `null` on anything unparseable so
+ * the caller can fall back to a missing hint instead of treating a
+ * malformed header as zero.
+ */
+export function parseRateLimitDuration(value: string | null): number | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  // Plain number → interpret as seconds (the OpenAI legacy shape).
+  const asNumber = Number(trimmed);
+  if (Number.isFinite(asNumber)) {
+    return Math.max(0, asNumber * 1000);
+  }
+  // Compound duration: h/m/s/ms. `ms` must come before `m|s` in the
+  // alternation so that "10ms" parses as (10)(ms), not (10m) + dangling s.
+  const re = /(\d+(?:\.\d+)?)\s*(ms|s|m|h)/gi;
+  let total = 0;
+  let any = false;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(trimmed)) !== null) {
+    any = true;
+    const v = parseFloat(match[1]);
+    if (!Number.isFinite(v)) return null;
+    switch (match[2].toLowerCase()) {
+      case "ms":
+        total += v;
+        break;
+      case "s":
+        total += v * 1000;
+        break;
+      case "m":
+        total += v * 60_000;
+        break;
+      case "h":
+        total += v * 3_600_000;
+        break;
+    }
+  }
+  return any ? total : null;
+}
+
+function parseIntegerHeader(value: string | null): number | null {
+  if (!value) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.trunc(n));
+}
+
+/**
+ * Sample the standard OpenAI-compat rate-limit headers off a 2xx
+ * response. Returns `null` when none of the four fields are present
+ * — the caller treats `null` as "provider didn't tell us, stay at
+ * the configured cap".
+ */
+export function parseRateLimitHeaders(
+  headers: Headers,
+): RateLimitHint | null {
+  const rem_req = parseIntegerHeader(
+    headers.get("x-ratelimit-remaining-requests"),
+  );
+  const rem_tok = parseIntegerHeader(
+    headers.get("x-ratelimit-remaining-tokens"),
+  );
+  const reset_req = parseRateLimitDuration(
+    headers.get("x-ratelimit-reset-requests"),
+  );
+  const reset_tok = parseRateLimitDuration(
+    headers.get("x-ratelimit-reset-tokens"),
+  );
+  if (
+    rem_req === null &&
+    rem_tok === null &&
+    reset_req === null &&
+    reset_tok === null
+  ) {
+    return null;
+  }
+  return {
+    remaining_requests: rem_req,
+    remaining_tokens: rem_tok,
+    reset_requests_ms: reset_req,
+    reset_tokens_ms: reset_tok,
+    observed_at: nowMillis(),
   };
 }
 

@@ -134,6 +134,41 @@ export async function readLlmConfig(): Promise<LibraryLlmConfigRow> {
   return ensureEmbeddingDefaults(row);
 }
 
+/**
+ * Seed the LLM singleton from `.env` build-time defaults on first
+ * run. Idempotent: if a Dexie row already exists, this function is a
+ * no-op and returns `{ seeded: false }` along with the existing row.
+ * Otherwise it writes a single row that merges `DEFAULT_LLM_CONFIG`
+ * with the supplied partial and returns `{ seeded: true }`.
+ *
+ * Curator-managed state always wins. Once any value has been saved
+ * via the Settings card, env defaults stop influencing the
+ * configuration until the curator explicitly clears the Dexie row.
+ * That keeps the seed strictly first-run and never silently rewrites
+ * a curator-edited URL or key.
+ *
+ * The merge is shallow on top of `DEFAULT_LLM_CONFIG` so absent env
+ * fields fall back to the same hard-coded defaults the rest of the
+ * codebase has always seen. `embedding` is preserved verbatim from
+ * the defaults because env doesn't (yet) describe embeddings.
+ */
+export async function seedLlmConfigIfEmpty(
+  patch: Partial<Omit<LibraryLlmConfigRow, "key">>,
+): Promise<{ seeded: boolean; row: LibraryLlmConfigRow }> {
+  const existing = await libraryDb().llm.get("llm");
+  if (existing) {
+    return { seeded: false, row: ensureEmbeddingDefaults(existing) };
+  }
+  const hasAnyPatch =
+    patch && Object.keys(patch).length > 0;
+  if (!hasAnyPatch) {
+    return { seeded: false, row: DEFAULT_LLM_CONFIG };
+  }
+  const next: LibraryLlmConfigRow = { ...DEFAULT_LLM_CONFIG, ...patch };
+  await libraryDb().llm.put(next);
+  return { seeded: true, row: ensureEmbeddingDefaults(next) };
+}
+
 export async function writeLlmConfig(
   patch: Partial<Omit<LibraryLlmConfigRow, "key">>,
 ): Promise<LibraryLlmConfigRow> {

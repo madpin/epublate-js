@@ -46,8 +46,9 @@ import {
 import { type EmbeddingProvider } from "@/llm/embeddings/base";
 import { resolveProjectGlossaryWithLore } from "@/lore/attach";
 import { nowMs } from "@/lib/time";
-import { type LLMProvider } from "@/llm/base";
+import { type LLMProvider, type RateLimitHint } from "@/llm/base";
 import { LLMRateLimitError } from "@/llm/base";
+import { Throttle } from "@/lib/throttle";
 import {
   SegmentStatus,
   type SegmentRow,
@@ -77,6 +78,36 @@ export const BATCH_RETRY_DEFAULTS: Required<BatchRetryConfig> = {
   error_window_size: 100,
   max_errors_in_window: 10,
 };
+
+/**
+ * Derive an effective in-flight concurrency cap from the configured
+ * cap and the most recent rate-limit hint from the provider.
+ *
+ * Policy (deliberately simple — provider hints are noisy):
+ *
+ * - No hint, or `remaining_requests` is `null` → keep the configured
+ *   cap unchanged. This is the path every non-OpenAI provider takes,
+ *   so the helper is a no-op for `mock`, raw Ollama, llama.cpp, etc.
+ * - Otherwise the effective cap is `floor(remaining / 2)`, clamped
+ *   to `[1, configured]`. We never amplify beyond the curator's
+ *   chosen value and we always make forward progress (floor = 1).
+ *
+ * The `÷2` is the "leave half the window for someone else"
+ * safety factor — gives the throttle some slack so a brief co-tenant
+ * spike doesn't push the next call into a 429.
+ *
+ * Exported (and `internal`) so the batch tests can pin the policy.
+ */
+export function deriveConcurrencyCap(
+  configured: number,
+  hint: RateLimitHint | null,
+): number {
+  if (!hint) return configured;
+  const rem = hint.remaining_requests;
+  if (rem === null || !Number.isFinite(rem)) return configured;
+  const budget = Math.max(1, Math.floor(rem / 2));
+  return Math.min(configured, budget);
+}
 
 /**
  * Clamp a hand-edited (or undefined) `BatchRetryConfig` into a fully
@@ -482,6 +513,42 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
   // failure-isolation so one segment's exception doesn't sink the
   // others.
   let cursor = 0;
+  // Adaptive concurrency: a shared throttle whose cap may shrink
+  // below the configured `concurrency` when the provider's
+  // `x-ratelimit-remaining-requests` is low, and recover back up to
+  // it as the window resets. Workers `acquire()` immediately before
+  // calling `translateSegment` and `release()` in the matching
+  // `finally`. When the provider doesn't expose rate-limit headers
+  // (mock, raw Ollama, llama.cpp) the cap stays at `concurrency` for
+  // the entire run and the throttle is a no-op gate — identical
+  // wall-clock to the pre-throttle code path.
+  const throttle = new Throttle(concurrency);
+  // Snapshot of the effective cap at last adjustment, so we can fire
+  // an audit event only on transitions instead of every successful
+  // segment.
+  let last_effective_cap = concurrency;
+
+  function adjustCapFromProvider(): void {
+    if (typeof provider.getRateLimitHint !== "function") return;
+    const hint = provider.getRateLimitHint();
+    const effective = deriveConcurrencyCap(concurrency, hint);
+    if (effective !== throttle.currentCap) {
+      throttle.setCap(effective);
+      if (effective !== last_effective_cap) {
+        // Don't await: audit is best-effort and the worker has
+        // useful work to do.
+        void appendEvent(project_id, "batch.concurrency_adjusted", {
+          from: last_effective_cap,
+          to: effective,
+          configured: concurrency,
+          remaining_requests: hint?.remaining_requests ?? null,
+          remaining_tokens: hint?.remaining_tokens ?? null,
+          reset_requests_ms: hint?.reset_requests_ms ?? null,
+        });
+        last_effective_cap = effective;
+      }
+    }
+  }
 
   async function worker(): Promise<void> {
     while (true) {
@@ -490,8 +557,25 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
         cancelled = true;
         return;
       }
+      // Park here until the adaptive throttle has a free slot, so
+      // we never exceed the dynamic cap even when more workers were
+      // spawned than the cap currently allows. The throttle is
+      // re-checked after acquire so a shrunken cap can re-park us.
+      await throttle.acquire();
+      if (cancelled || paused) {
+        throttle.release();
+        return;
+      }
+      if (signal?.aborted) {
+        cancelled = true;
+        throttle.release();
+        return;
+      }
       const i = cursor++;
-      if (i >= pending.length) return;
+      if (i >= pending.length) {
+        throttle.release();
+        return;
+      }
       const seg_row = pending[i]!;
       const seg = rowToSegment(seg_row);
       // The "in-flight" pulse is fired around every translateSegment
@@ -679,8 +763,19 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
         } catch {
           // Lifecycle callbacks must never sink the batch.
         }
+        // Sample the provider's most recent x-ratelimit-* snapshot
+        // and adjust the throttle BEFORE releasing the slot, so the
+        // next worker to acquire sees the up-to-date cap. Safe under
+        // failure: a failed call typically still observed response
+        // headers on a non-rate-limited HTTP path, and a rate-limit
+        // pause has already set `paused = true` above.
+        adjustCapFromProvider();
+        throttle.release();
       }
     }
+    // Make sure no peer worker is parked on us when we exit. A peer
+    // that wakes after pause/cancel sees the flags and exits cleanly.
+    if (cancelled || paused) throttle.drainWaiters();
   }
 
   function recordOutcome(failed: boolean): void {

@@ -30,6 +30,22 @@ All LLM traffic flows through the `LLMProvider` interface in
   past edits.
 - **No prompt mutation after building.** `buildTranslatorMessages`
   returns the canonical message list; downstream code only reads it.
+- **Rate-limit hints are advisory, not authoritative.** Providers
+  that expose `x-ratelimit-*` headers should populate the optional
+  `getRateLimitHint(): RateLimitHint | null` slot via
+  `parseRateLimitHeaders` (only on 2xx). The batch runner reads
+  them to shrink concurrency below the configured ceiling — never
+  to extend it. Providers without the hint must return `null` so
+  the runner stays at the static cap.
+- **`.env` is first-run bootstrap only.** Build-time
+  `VITE_EPUBLATE_LLM_*` defaults flow through
+  `src/lib/env_defaults.ts` and seed an *empty* Dexie LLM row via
+  `seedLlmConfigIfEmpty` on first hydrate. Once any value has been
+  saved through the Settings card, the persisted row wins — env
+  must never re-seed or silently overwrite a curator-edited row.
+  `VITE_EPUBLATE_LLM_API_KEY` is baked into the JS bundle by Vite;
+  the `.env.example` file is the canonical place this warning
+  lives.
 
 ## Pricing & tokens
 
