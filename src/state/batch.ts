@@ -10,19 +10,34 @@
  * follow-up jobs (e.g. queue chapter B while chapter A is still mid-
  * batch). `useRunBatch` consults the store, enqueues if a run is
  * already in flight, and on completion drains the queue automatically.
+ *
+ * Persistence: a sibling `state/batch_persist.ts` subscribes to this
+ * store and mirrors `active` + `queue` into the library DB so a
+ * page refresh restores the BatchStatusBar identically and lets the
+ * runner auto-resume from the persisted input. The store stays
+ * synchronous and side-effect-free; the persistence layer is opt-in
+ * (installed once at app boot in `App.tsx`).
  */
 
 import { create } from "zustand";
 
 import type { BatchSummary } from "@/core/batch";
+import type { PersistedBatchInput } from "@/db/schema";
 
 export interface ActiveBatch {
   project_id: string;
   project_name: string;
   started_at: number;
+  /** Curator-submitted input, replayed verbatim by the auto-resume
+   *  hook after a refresh. Stored on the `active` row (not just on
+   *  the queue items) so a single-tab refresh during the very first
+   *  segment of a fresh batch can still pick it back up. */
+  input: PersistedBatchInput;
   /** Snapshot of the running summary; mutated as workers complete. */
   summary: BatchSummary;
-  /** Curator presses Cancel ⇒ we abort. Set by the runner caller. */
+  /** Curator presses Cancel ⇒ we abort. Set by the runner caller.
+   *  Process-only; not persisted (a fresh AbortController is
+   *  reconstructed when the auto-resume hook calls `start` again). */
   controller: AbortController;
   /** True after `runBatch` returns / throws — used to keep the bar on
    * screen long enough for the user to see the final tally. */
@@ -56,6 +71,7 @@ interface BatchStore {
   start(opts: {
     project_id: string;
     project_name: string;
+    input: PersistedBatchInput;
     summary: BatchSummary;
     controller: AbortController;
   }): void;
@@ -74,18 +90,32 @@ interface BatchStore {
   dequeue(): QueuedBatch | null;
   removeQueued(id: string): void;
   clearQueue(): void;
+  /**
+   * Replace `active` and `queue` wholesale. Used by the bootstrap
+   * path in `App.tsx` to repaint the BatchStatusBar from the
+   * persisted library DB row before the curator sees first paint.
+   *
+   * Distinct from `start` because it doesn't allocate a new
+   * `started_at`/AbortController — it carries over whatever the
+   * caller assembled from the persisted snapshot.
+   */
+  hydrate(opts: {
+    active: ActiveBatch | null;
+    queue: QueuedBatch[];
+  }): void;
 }
 
 export const useBatchStore = create<BatchStore>()((set, get) => ({
   active: null,
   queue: [],
 
-  start({ project_id, project_name, summary, controller }) {
+  start({ project_id, project_name, input, summary, controller }) {
     set({
       active: {
         project_id,
         project_name,
         started_at: Date.now(),
+        input,
         summary,
         controller,
         finished: false,
@@ -148,5 +178,9 @@ export const useBatchStore = create<BatchStore>()((set, get) => ({
 
   clearQueue() {
     set({ queue: [] });
+  },
+
+  hydrate({ active, queue }) {
+    set({ active, queue });
   },
 }));

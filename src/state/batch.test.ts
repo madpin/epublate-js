@@ -77,6 +77,14 @@ describe("useBatchStore queue", () => {
     useBatchStore.getState().start({
       project_id: "p",
       project_name: "P",
+      input: {
+        project_id: "p",
+        budget_usd: null,
+        concurrency: 1,
+        bypass_cache: false,
+        chapter_ids: null,
+        pre_pass: false,
+      },
       summary,
       controller: new AbortController(),
     });

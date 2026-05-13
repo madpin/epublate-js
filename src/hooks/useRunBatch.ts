@@ -23,6 +23,7 @@ import {
   createSummary,
   runBatch,
   type BatchOptions,
+  type BatchSummary,
 } from "@/core/batch";
 import { listGlossaryEntries } from "@/db/repo/glossary";
 import { newId } from "@/lib/id";
@@ -30,6 +31,7 @@ import { buildProvider, type ProjectLlmOverrides } from "@/llm/factory";
 import { useBatchStore, type QueuedBatch } from "@/state/batch";
 import { useAppStore } from "@/state/app";
 import { useTranslatingStore } from "@/state/translating";
+import type { PersistedBatchInput } from "@/db/schema";
 
 export interface StartBatchInput {
   project_id: string;
@@ -50,6 +52,17 @@ export interface StartBatchOptions {
   queue_if_busy?: boolean;
   /** Curator-friendly label for the queued entry (e.g. "1 chapter"). */
   label?: string;
+  /**
+   * Auto-resume baseline (set by `useResumeInterruptedBatch` after a
+   * page refresh). When provided, the runner extends this summary
+   * instead of starting fresh, so the BatchStatusBar's meter doesn't
+   * reset across the refresh boundary. Counters add to the baseline;
+   * `total` grows to fit `baseline_done + remaining_pending`.
+   *
+   * Curator-initiated calls leave this `undefined`; only the resume
+   * hook ever sets it.
+   */
+  resume_baseline?: BatchSummary | null;
 }
 
 export function useRunBatch(): {
@@ -88,8 +101,16 @@ export function useRunBatch(): {
       // queue check is consistent even when the previous render
       // already saw `finished: true` but the next batch hasn't
       // flushed through yet.
+      //
+      // Special case for `resume_baseline`: the auto-resume hook
+      // hydrates `useBatchStore.active` from the persisted row
+      // *before* calling start(), so the store always looks "busy"
+      // at that point. We treat the presence of a baseline as
+      // explicit permission to take over the existing record —
+      // the runner's own `start_store` call below overwrites it.
       const live = useBatchStore.getState().active;
-      const busy = live !== null && !live.finished;
+      const is_resume = options.resume_baseline != null;
+      const busy = !is_resume && live !== null && !live.finished;
 
       if (busy) {
         if (options.queue_if_busy) {
@@ -152,10 +173,18 @@ export function useRunBatch(): {
       const batch_retry = lib_llm?.batch_retry ?? null;
 
       const controller = new AbortController();
-      const initial = createSummary();
+      // Initial summary the BatchStatusBar paints before the first
+      // segment lands. On auto-resume we seed it with the persisted
+      // baseline so the meter shows the cumulative tally from the
+      // very first frame after the refresh, not "0/N".
+      const initial = options.resume_baseline
+        ? cloneSummary(options.resume_baseline)
+        : createSummary();
+      const persisted_input = toPersistedInput(input);
       start_store({
         project_id: input.project_id,
         project_name: lib_row.name,
+        input: persisted_input,
         summary: initial,
         controller,
       });
@@ -193,6 +222,7 @@ export function useRunBatch(): {
             remove_translating(input.project_id, ev.segment_id);
           },
           signal: controller.signal,
+          resume_baseline: options.resume_baseline ?? null,
         });
         finish_store({ summary: final, final_status: "completed" });
         clear_translating(input.project_id);
@@ -274,6 +304,36 @@ function describeInput(input: StartBatchInput): string {
   if (!ids || ids.length === 0) return "all pending segments";
   if (ids.length === 1) return "1 chapter";
   return `${ids.length} chapters`;
+}
+
+/**
+ * Project the runner's `StartBatchInput` shape into the persistable
+ * row written to the library DB. Optional fields collapse to the
+ * same defaults the runner would apply, so a re-hydrated input is a
+ * round-trip equivalent of the original.
+ */
+function toPersistedInput(input: StartBatchInput): PersistedBatchInput {
+  return {
+    project_id: input.project_id,
+    budget_usd: input.budget_usd === undefined ? null : input.budget_usd,
+    concurrency: input.concurrency ?? 1,
+    bypass_cache: input.bypass_cache ?? false,
+    chapter_ids: input.chapter_ids ?? null,
+    pre_pass: input.pre_pass ?? false,
+  };
+}
+
+/**
+ * Deep-ish clone of a `BatchSummary`. Only the `failures` array
+ * needs unsharing for our use; all other fields are primitives.
+ * Local copy to keep this hook independent of `core/batch.ts`'s
+ * private helpers.
+ */
+function cloneSummary(s: BatchSummary): BatchSummary {
+  return {
+    ...s,
+    failures: s.failures.map((f) => ({ ...f })),
+  };
 }
 
 async function readProjectOverrides(

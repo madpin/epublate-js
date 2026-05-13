@@ -769,13 +769,43 @@ Five Zustand stores, each with a single, narrow concern. No global event bus. Ev
 | ------------------------------ | -------------------------- | ---------------------- | -------------------------------------------------- |
 | `useAppStore`                  | `state/app.ts`             | `epublate-library` IDB | Theme, LLM config, mock-mode flag                  |
 | `useUiStore`                   | `state/ui.ts`              | none                   | Cheat-sheet open/closed, transient UI flags        |
-| `useBatchStore`                | `state/batch.ts`           | none                   | Active batch (per tab), pending queue              |
+| `useBatchStore`                | `state/batch.ts`           | `epublate-library` IDB (via `batch_persist`) | Active batch + pending queue (refresh-resumable)   |
 | `useTranslatingStore`          | `state/translating.ts`     | none                   | Set of in-flight segment ids (Reader highlights)   |
 | `useLastProjectStore`          | `state/last_project.ts`    | `localStorage`         | Last-active project id (sidebar fallback)          |
 
 The pattern is consistent: state lives in Zustand, side-effects (Dexie writes, localStorage writes) live in store actions, components subscribe via small `useStore(s => s.field)` selectors. There's no Redux-style action bus and no global Context; the AppShell and the routes don't share any state object beyond the stores.
 
 Persistent rows live in Dexie, **not** in Zustand. The Reader's segment list comes from `useLiveQuery(() => db.segments.where(...))`, not from a Zustand cache. This keeps the batch runner's writes and the Reader's reads naturally consistent — Dexie's `useLiveQuery` re-fires on any matching change.
+
+### Refresh-resumable batches
+
+`useBatchStore` is the one Zustand store with a Dexie-backed
+mirror. The sibling `state/batch_persist.ts` module subscribes to
+the store and writes a singleton `batch_state` row on every change
+(throttled to ~10 Hz). Three reasons to bend the "no persistence"
+rule for this store:
+
+1. **First-paint continuity.** `useAppStore.hydrate()` reads the
+   persisted row in parallel with the LLM/UI singletons, then
+   seeds `useBatchStore.active` + `queue` *before* `ready=true`.
+   The BatchStatusBar mounts with the same numbers it showed
+   before the refresh — no flash of "no active batch".
+2. **Auto-resume.** `useResumeInterruptedBatch` (mounted in
+   `AppShell`) decides whether to take ownership of an
+   `status="running"` row. It calls `useRunBatch.start()` with the
+   persisted input plus a `resume_baseline: BatchSummary` so the
+   runner counts onto the existing tally (`total = baseline_done +
+   remaining_pending`) instead of resetting to "0/N".
+3. **Cross-tab safety.** The owner tab refreshes a 2 s heartbeat
+   while the run is active and clears `owner_session_id` in the
+   `pagehide` handler. A sibling tab opened mid-batch sees a fresh
+   heartbeat and politely mirrors instead of competing for IDB
+   writes; if the owner dies hard, the heartbeat eventually goes
+   stale (≥ 6 s) and the next tab to boot claims the run.
+
+Curator dismissal still removes the row — once the BatchStatusBar's
+"Dismiss" button fires, `useBatchStore.dismiss()` empties the store
+and the persistence subscriber writes through with `clearBatchState()`.
 
 ---
 

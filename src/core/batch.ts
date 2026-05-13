@@ -281,6 +281,18 @@ export interface RunBatchInput {
   /** Fired after each segment settles, regardless of outcome. */
   on_segment_end?: SegmentLifecycleCallback;
   signal?: AbortSignal;
+  /**
+   * When set, the runner continues a previous batch instead of
+   * starting from zero. Counters in the new summary are pre-loaded
+   * from the baseline, and `summary.total` is grown to fit so the
+   * BatchStatusBar's meter never moves backwards across the resume
+   * boundary.
+   *
+   * Used by the auto-resume hook (`useResumeInterruptedBatch`) after
+   * a page refresh. The baseline carries no AbortController and no
+   * provider state — it's just an accumulator snapshot.
+   */
+  resume_baseline?: BatchSummary | null;
 }
 
 /**
@@ -402,9 +414,30 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
       ? project_glossary_state
       : await resolveProjectGlossaryWithLore(project_id, project_glossary_state);
 
-  const summary = createSummary();
-  summary.total = pending.length;
+  // Resume continuity: when the caller supplies a baseline summary
+  // (auto-resume after refresh), preserve its accumulators and grow
+  // `total` so the BatchStatusBar meter doesn't reset to "0/N" or
+  // jump backwards. The new run's pending list is a *subset* of the
+  // original work — we just keep counting onto the existing tally.
+  const baseline = input.resume_baseline ?? null;
+  const summary = baseline ? cloneSummary(baseline) : createSummary();
+  // Re-derive total from baseline_done + remaining_pending so the
+  // meter stays accurate even if the curator manually translated a
+  // few segments between the original start and the refresh, or if
+  // a glossary cascade reset previously-translated segments back to
+  // pending.
+  const baseline_done = baseline
+    ? baseline.translated + baseline.cached + baseline.flagged + baseline.failed
+    : 0;
+  summary.total = baseline ? baseline_done + pending.length : pending.length;
+  // `paused_reason` from the baseline is stale — we're starting again.
+  summary.paused_reason = null;
   const started = performance.now();
+  // Carry the baseline's elapsed_s forward so the BatchStatusBar
+  // ETA heuristic (rate = done / elapsed_s) divides cumulative work
+  // by cumulative time and stays sane across the resume boundary.
+  // Workers update `elapsed_s` as `baseline_elapsed + this-run-elapsed`.
+  const baseline_elapsed_s = baseline?.elapsed_s ?? 0;
 
   await appendEvent(project_id, "batch.started", {
     model: options.model,
@@ -412,10 +445,13 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
     budget_usd: effective_budget,
     segment_count: pending.length,
     chapter_ids: options.chapter_ids ?? null,
+    resumed: baseline !== null,
+    resumed_baseline_done: baseline_done,
   });
 
   if (pending.length === 0) {
-    summary.elapsed_s = (performance.now() - started) / 1000;
+    summary.elapsed_s =
+      baseline_elapsed_s + (performance.now() - started) / 1000;
     await appendEvent(project_id, "batch.completed", summaryPayload(summary));
     return summary;
   }
@@ -649,7 +685,8 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
               effective_budget !== null &&
               effective_budget !== undefined &&
               summary.cost_usd > effective_budget;
-            summary.elapsed_s = (performance.now() - started) / 1000;
+            summary.elapsed_s =
+              baseline_elapsed_s + (performance.now() - started) / 1000;
             on_progress?.({
               segment_id: seg.id,
               chapter_id: seg.chapter_id,
@@ -728,7 +765,8 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
             error: msg,
             attempts_used: max_retries + 1,
           });
-          summary.elapsed_s = (performance.now() - started) / 1000;
+          summary.elapsed_s =
+            baseline_elapsed_s + (performance.now() - started) / 1000;
           on_progress?.({
             segment_id: seg_row.id,
             chapter_id: seg_row.chapter_id,
@@ -811,7 +849,8 @@ export async function runBatch(input: RunBatchInput): Promise<BatchSummary> {
     /* prefetcher already audited its own failures */
   }
 
-  summary.elapsed_s = (performance.now() - started) / 1000;
+  summary.elapsed_s =
+    baseline_elapsed_s + (performance.now() - started) / 1000;
 
   if (paused) {
     summary.paused_reason = pause_reason;

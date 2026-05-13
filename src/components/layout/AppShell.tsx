@@ -70,6 +70,7 @@ import {
 } from "@/components/ui/tooltip";
 import { useOnlineStatus } from "@/hooks/useOnlineStatus";
 import { usePwaInstall } from "@/hooks/usePwaInstall";
+import { useResumeInterruptedBatch } from "@/hooks/useResumeInterruptedBatch";
 
 interface NavItem {
   /** Path suffix (no leading `/project/:id` — that gets prepended for project items). */
@@ -109,6 +110,12 @@ export function AppShell(): React.JSX.Element {
   const last_project_id = useLastProjectStore((s) => s.last_project_id);
   const remember_last = useLastProjectStore((s) => s.remember);
   const forget_last = useLastProjectStore((s) => s.forget);
+
+  // After a refresh, the persisted batch row drives both the
+  // BatchStatusBar's first paint (via `useAppStore.hydrate`) and the
+  // auto-resume of the runner here. The hook is a one-shot effect
+  // that no-ops when there's nothing to resume.
+  useResumeInterruptedBatch();
 
   // One-shot notice on the very first boot where `.env` seeded the
   // LLM Settings row. Clearing the flag immediately afterwards keeps

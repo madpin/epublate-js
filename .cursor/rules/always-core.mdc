@@ -22,8 +22,12 @@ on-every-turn checklist.
   on word boundaries; particle suffixes round-trip
   (`Saito-san` ↔ `Saito-さん`).
 - **Resumability.** Every batch operation persists per-segment state.
-  Closing the tab is harmless: re-opening picks up at `pending` /
-  `flagged`. Don't store work-in-progress only in React state.
+ Closing the tab is harmless: re-opening picks up at `pending` /
+ `flagged`. Don't store work-in-progress only in React state.
+ Page refresh is also resumable — `useBatchStore` is mirrored to the
+ library DB by `state/batch_persist.ts`, and
+ `useResumeInterruptedBatch` re-calls the runner with a
+ `resume_baseline` so the BatchStatusBar stays continuous.
 - **OpenAI-compatible only.** All LLM traffic goes through
   `LLMProvider` (`src/llm/base.ts`). Every call is recorded in
   `llm_calls`. Don't widen the provider surface.

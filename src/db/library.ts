@@ -19,11 +19,14 @@
 import Dexie, { type Table } from "dexie";
 
 import {
+  type LibraryBatchStateRow,
   type LibraryEmbeddingConfig,
   type LibraryLlmConfigRow,
   type LibraryLoreBookRow,
   type LibraryProjectRow,
   type LibraryUiPrefsRow,
+  type PersistedActiveBatch,
+  type PersistedQueuedBatch,
   type ThemeIdT,
   DEFAULT_EMBEDDING_CONFIG,
   ThemeId,
@@ -36,6 +39,7 @@ export class LibraryDb extends Dexie {
   loreBooks!: Table<LibraryLoreBookRow, string>;
   ui!: Table<LibraryUiPrefsRow, "prefs">;
   llm!: Table<LibraryLlmConfigRow, "llm">;
+  batch_state!: Table<LibraryBatchStateRow, "batch">;
 
   constructor() {
     super(DB_NAME);
@@ -44,6 +48,13 @@ export class LibraryDb extends Dexie {
       loreBooks: "id, opened_at, created_at, name",
       ui: "key",
       llm: "key",
+    });
+    // v2: persist the in-flight batch so a curator-initiated refresh
+    // resumes the run instead of orphaning it. Singleton row keyed
+    // by `"batch"`. The empty `.upgrade()` is intentional — adding a
+    // brand-new store doesn't need to touch existing rows.
+    this.version(2).stores({
+      batch_state: "key",
     });
   }
 }
@@ -226,6 +237,100 @@ export async function touchLibraryLoreBook(id: string): Promise<void> {
 
 export async function removeLibraryLoreBook(id: string): Promise<void> {
   await libraryDb().loreBooks.delete(id);
+}
+
+// ---------- Persisted batch state ----------
+
+/**
+ * Empty default returned when no batch row exists yet. Reading
+ * always returns a usable shape (rather than `undefined`) so callers
+ * can destructure `active` / `queue` without a null guard.
+ */
+export const EMPTY_BATCH_STATE: LibraryBatchStateRow = {
+  key: "batch",
+  active: null,
+  queue: [],
+};
+
+export async function readBatchState(): Promise<LibraryBatchStateRow> {
+  const row = await libraryDb().batch_state.get("batch");
+  if (!row) return EMPTY_BATCH_STATE;
+  return {
+    key: "batch",
+    active: row.active ?? null,
+    queue: Array.isArray(row.queue) ? row.queue : [],
+  };
+}
+
+/**
+ * Replace the singleton row. Pass `{ active: null, queue: [] }`
+ * (or call {@link clearBatchState}) to drop the row entirely once
+ * the curator dismisses a finished batch.
+ */
+export async function writeBatchState(
+  next: { active: PersistedActiveBatch | null; queue: PersistedQueuedBatch[] },
+): Promise<void> {
+  if (!next.active && next.queue.length === 0) {
+    await clearBatchState();
+    return;
+  }
+  await libraryDb().batch_state.put({
+    key: "batch",
+    active: next.active,
+    queue: next.queue,
+  });
+}
+
+/**
+ * Touch the heartbeat fields without rewriting `summary`/`queue`.
+ *
+ * Called from the persistence layer's heartbeat loop while a batch
+ * is actively running in this tab. Intentionally a no-op when the
+ * row is missing or its status has flipped to a terminal state —
+ * we should never resurrect a dismissed row by writing a heartbeat.
+ */
+export async function touchBatchHeartbeat(opts: {
+  owner_session_id: string;
+  heartbeat_ms: number;
+}): Promise<void> {
+  const db = libraryDb();
+  await db.transaction("rw", db.batch_state, async () => {
+    const row = await db.batch_state.get("batch");
+    if (!row?.active) return;
+    if (row.active.status !== "running") return;
+    await db.batch_state.put({
+      key: "batch",
+      active: {
+        ...row.active,
+        owner_session_id: opts.owner_session_id,
+        heartbeat_ms: opts.heartbeat_ms,
+      },
+      queue: row.queue ?? [],
+    });
+  });
+}
+
+/**
+ * Clear the persisted owner_session_id without touching anything
+ * else. Called from the `pagehide` handler so the next boot of the
+ * same (or another) tab can claim ownership immediately instead of
+ * waiting for the heartbeat to expire.
+ */
+export async function releaseBatchOwnership(): Promise<void> {
+  const db = libraryDb();
+  await db.transaction("rw", db.batch_state, async () => {
+    const row = await db.batch_state.get("batch");
+    if (!row?.active) return;
+    await db.batch_state.put({
+      key: "batch",
+      active: { ...row.active, owner_session_id: null },
+      queue: row.queue ?? [],
+    });
+  });
+}
+
+export async function clearBatchState(): Promise<void> {
+  await libraryDb().batch_state.delete("batch");
 }
 
 /** Friendly DB names for the IDB inspector / debug logs. */

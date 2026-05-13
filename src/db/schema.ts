@@ -508,6 +508,116 @@ export interface LibraryLoreBookRow {
   entries_locked: number;
 }
 
+/**
+ * Persisted snapshot of the curator's in-flight batch run.
+ *
+ * Why this lives in the library DB even though batch progress is
+ * "process state": when the curator hits refresh mid-translation we
+ * want to (a) repaint the BatchStatusBar identically before the React
+ * tree mounts, and (b) auto-resume the runner against the same input
+ * so the wall-clock cost of the refresh is just the network round-
+ * trip for a few in-flight segments. Rebuilding either of those from
+ * `events`/`segments` alone would lose the curator-visible meter
+ * totals (the original `pending.length` snapshot at start) and force
+ * a stutter where the bar disappears and re-appears.
+ *
+ * Singleton row, key = "batch". Cleared by `useBatchStore.dismiss()`
+ * once the curator acknowledges a finished batch — same UX as before
+ * the persisted layer was added.
+ *
+ * Cross-tab safety:
+ *
+ * - The owner tab writes its `owner_session_id` and refreshes
+ *   `heartbeat_ms` every ~2 s while the run is active.
+ * - On `pagehide` the owner clears `owner_session_id` so a refresh
+ *   in the same tab takes ownership immediately on the next boot
+ *   (no need to wait for heartbeat to go stale).
+ * - A second tab opened while the first is mid-batch sees a fresh
+ *   heartbeat and politely mirrors instead of competing for IDB
+ *   writes; if the owner dies hard, the heartbeat eventually goes
+ *   stale and the mirror tab takes over.
+ */
+export interface LibraryBatchStateRow {
+  /** Singleton row, key = "batch". */
+  key: "batch";
+  active: PersistedActiveBatch | null;
+  queue: PersistedQueuedBatch[];
+}
+
+/**
+ * Subset of `StartBatchInput` (see `src/hooks/useRunBatch.ts`) that
+ * survives a JSON round-trip through Dexie. Fields are kept
+ * non-optional with nullable defaults so a hand-edited Dexie row
+ * round-trips without the runner having to re-clamp every field.
+ */
+export interface PersistedBatchInput {
+  project_id: string;
+  budget_usd: number | null;
+  concurrency: number;
+  bypass_cache: boolean;
+  chapter_ids: readonly string[] | null;
+  pre_pass: boolean;
+}
+
+/**
+ * Mirror of `core/batch.BatchSummary` shaped for storage. Identical
+ * field set; declared here so `src/db/schema.ts` doesn't import from
+ * `src/core/*` (preserves the persistence-layer's "no behaviour
+ * imports" rule).
+ */
+export interface PersistedBatchSummary {
+  translated: number;
+  cached: number;
+  flagged: number;
+  failed: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_usd: number;
+  elapsed_s: number;
+  total: number;
+  paused_reason: string | null;
+  failures: Array<{ segment_id: string; error: string }>;
+}
+
+export interface PersistedActiveBatch {
+  project_id: string;
+  project_name: string;
+  started_at: number;
+  /** Curator-submitted input; replayed on auto-resume. */
+  input: PersistedBatchInput;
+  /** Latest progress snapshot the BatchStatusBar should re-paint. */
+  summary: PersistedBatchSummary;
+  /**
+   * Lifecycle of the persisted run.
+   *
+   * - `running` — a tab is (or was) actively driving the work. Auto-
+   *   resume kicks in if the heartbeat is stale or the owner cleared
+   *   itself on `pagehide`.
+   * - `completed` / `cancelled` / `paused` — terminal display state.
+   *   The bar still shows it until the curator dismisses; refresh
+   *   keeps showing the same final tally.
+   */
+  status: "running" | "completed" | "cancelled" | "paused";
+  paused_reason: string | null;
+  /**
+   * Owner tab's session id. Cleared on `pagehide` so a refresh in
+   * the same tab takes over on next boot without waiting for the
+   * heartbeat to expire. `null` ⇒ "no live owner, safe to claim".
+   */
+  owner_session_id: string | null;
+  /** Wall-clock ms of the most recent heartbeat from the owner tab. */
+  heartbeat_ms: number;
+}
+
+export interface PersistedQueuedBatch {
+  id: string;
+  project_id: string;
+  project_name: string;
+  enqueued_at: number;
+  label: string;
+  input: PersistedBatchInput;
+}
+
 export interface LibraryUiPrefsRow {
   /** Singleton row, key = `"prefs"`. */
   key: "prefs";

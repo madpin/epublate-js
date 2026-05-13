@@ -3,6 +3,7 @@ import { RouterProvider } from "react-router-dom";
 
 import { router } from "./router";
 import { useAppStore } from "@/state/app";
+import { installBatchStatePersistence } from "@/state/batch_persist";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 /**
@@ -17,6 +18,17 @@ export function App(): React.JSX.Element {
   React.useEffect(() => {
     void hydrate();
   }, [hydrate]);
+
+  // Mirror the batch store into the library DB once hydration has
+  // finished. We delay until `ready` so the hydrate's initial
+  // `setState({active, queue})` doesn't immediately bounce back to
+  // disk (the row would already be the same shape; harmless but
+  // wasteful), and so the persistence layer's `pagehide` handler
+  // doesn't misfire if hydration ever errors out.
+  React.useEffect(() => {
+    if (!ready) return;
+    installBatchStatePersistence();
+  }, [ready]);
 
   if (!ready) {
     return (

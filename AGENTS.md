@@ -62,7 +62,12 @@ A browser-only ePub translation studio that:
      canonical place this warning lives.
 5. **Resumability.** Every batch operation writes durable per-segment
    state. Closing the tab is harmless: opening the project again resumes
-   from `pending`/`flagged` segments.
+   from `pending`/`flagged` segments. **Page refresh is also safe:**
+   `useBatchStore` mirrors its `active` + `queue` into the library DB
+   via `state/batch_persist.ts`, and `useResumeInterruptedBatch`
+   re-calls `useRunBatch.start()` with the persisted input + a
+   `resume_baseline` summary so the BatchStatusBar's meter stays
+   continuous across the refresh boundary.
 6. **No silent data loss on schema change.** Bumping the Dexie schema
    means writing a `version(N)` upgrade with an explicit migration. We
    never wipe a user's data without their consent.
@@ -85,6 +90,7 @@ A browser-only ePub translation studio that:
 | `src/lib/env_defaults.ts` | (no Python equivalent)          | Build-time `.env` LLM defaults + Settings presets |
 | `src/workers/*`       | (none — Python ran in-process)      | Web Workers for off-main parsing & ZIP I/O |
 | `src/state/*`         | `epublate.app.state`                | Zustand stores                       |
+| `src/state/batch_persist.ts` | (no Python equivalent)        | Mirror `useBatchStore` into the library DB so a refresh resumes the run |
 | `src/components/*`    | `epublate.app.screens`              | UI screens & layout                  |
 | `src/core/export.ts`  | `epublate.core.export` (new)        | Build translated ePub from segments  |
 | `src/core/project_bundle.ts` | (no Python equivalent)        | Export/import portable project zips  |

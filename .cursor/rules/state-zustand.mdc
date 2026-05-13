@@ -21,6 +21,13 @@ batch progress meter, queued batches, app-wide LLM config snapshots.
 - **No persistence by default.** A page reload cancels in-flight work
   anyway, so a fresh empty store is the correct boot state. Use
   `localStorage` only for UI prefs (split-pane ratios, theme).
+  - **Exception (batch resume).** `useBatchStore` mirrors its
+    `active` + `queue` into the library DB via
+    `state/batch_persist.ts` so a page refresh restores the
+    BatchStatusBar identically and `useResumeInterruptedBatch`
+    can re-call `useRunBatch.start()` with the persisted input.
+    The store itself stays synchronous; the persistence layer is
+    a sibling subscriber installed once at boot.
 - **Selectors return stable references.** When subscribing to
   per-project slices, wrap the lookup in a selector factory so React
   only re-renders when *that* slice changes:

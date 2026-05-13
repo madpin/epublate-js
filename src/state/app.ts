@@ -15,6 +15,7 @@ import { create } from "zustand";
 import {
   DEFAULT_LLM_CONFIG,
   DEFAULT_UI_PREFS,
+  readBatchState,
   readLlmConfig,
   readUiPrefs,
   seedLlmConfigIfEmpty,
@@ -32,6 +33,11 @@ import {
   readLlmEnvDefaults,
 } from "@/lib/env_defaults";
 import { applyPricingOverrides } from "@/llm/pricing";
+import { useBatchStore } from "@/state/batch";
+import {
+  fromPersistedActive,
+  fromPersistedQueued,
+} from "@/state/batch_persist";
 
 interface AppStore {
   ready: boolean;
@@ -82,12 +88,21 @@ export const useAppStore = create<AppStore>()((set, get) => ({
     const seed_outcome = hasLlmEnvDefaults(env_defaults)
       ? await seedLlmConfigIfEmpty(env_defaults)
       : { seeded: false, row: null as LibraryLlmConfigRow | null };
-    const [ui, llm] = await Promise.all([
+    // Persisted batch row drives the BatchStatusBar's first paint.
+    // We read it here (in parallel with the other library rows) so
+    // the bar mounts already populated — no flash of "no active
+    // batch" before `useResumeInterruptedBatch` kicks in.
+    const [ui, llm, batch] = await Promise.all([
       readUiPrefs(),
       seed_outcome.row ? Promise.resolve(seed_outcome.row) : readLlmConfig(),
+      readBatchState(),
     ]);
     applyTheme(ui.theme);
     applyPricingOverrides(llm.pricing_overrides ?? {});
+    useBatchStore.getState().hydrate({
+      active: batch.active ? fromPersistedActive(batch.active) : null,
+      queue: batch.queue.map(fromPersistedQueued),
+    });
     set({
       ui,
       llm,

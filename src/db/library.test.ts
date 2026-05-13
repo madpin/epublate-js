@@ -1,13 +1,19 @@
 import { afterEach, describe, it, expect } from "vitest";
 
 import {
+  clearBatchState,
   DEFAULT_LLM_CONFIG,
   DEFAULT_UI_PREFS,
+  EMPTY_BATCH_STATE,
   libraryDb,
+  readBatchState,
   readLlmConfig,
   readUiPrefs,
+  releaseBatchOwnership,
   resetLibraryDbCache,
   seedLlmConfigIfEmpty,
+  touchBatchHeartbeat,
+  writeBatchState,
   writeLlmConfig,
   writeUiPrefs,
 } from "./library";
@@ -82,5 +88,126 @@ describe("seedLlmConfigIfEmpty", () => {
     expect(row).toEqual(DEFAULT_LLM_CONFIG);
     // And nothing is persisted to Dexie.
     expect(await libraryDb().llm.get("llm")).toBeUndefined();
+  });
+});
+
+describe("batch state helpers", () => {
+  const SAMPLE_INPUT = {
+    project_id: "p1",
+    budget_usd: 0.25,
+    concurrency: 2,
+    bypass_cache: false,
+    chapter_ids: ["ch1"] as readonly string[],
+    pre_pass: false,
+  };
+
+  it("readBatchState returns EMPTY_BATCH_STATE when the row is missing", async () => {
+    expect(await readBatchState()).toEqual(EMPTY_BATCH_STATE);
+  });
+
+  it("writeBatchState round-trips an active row", async () => {
+    await writeBatchState({
+      active: {
+        project_id: "p1",
+        project_name: "Project 1",
+        started_at: 100,
+        input: SAMPLE_INPUT,
+        summary: {
+          translated: 3,
+          cached: 0,
+          flagged: 0,
+          failed: 0,
+          prompt_tokens: 10,
+          completion_tokens: 20,
+          cost_usd: 0.001,
+          elapsed_s: 1.5,
+          total: 5,
+          paused_reason: null,
+          failures: [],
+        },
+        status: "running",
+        paused_reason: null,
+        owner_session_id: "tab-A",
+        heartbeat_ms: 200,
+      },
+      queue: [],
+    });
+    const row = await readBatchState();
+    expect(row.active!.project_name).toBe("Project 1");
+    expect(row.active!.input).toEqual(SAMPLE_INPUT);
+    expect(row.active!.summary.translated).toBe(3);
+  });
+
+  it("writeBatchState({active: null, queue: []}) clears the row", async () => {
+    await writeBatchState({
+      active: {
+        project_id: "p1",
+        project_name: "Project 1",
+        started_at: 100,
+        input: SAMPLE_INPUT,
+        summary: {
+          translated: 0,
+          cached: 0,
+          flagged: 0,
+          failed: 0,
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          cost_usd: 0,
+          elapsed_s: 0,
+          total: 0,
+          paused_reason: null,
+          failures: [],
+        },
+        status: "running",
+        paused_reason: null,
+        owner_session_id: null,
+        heartbeat_ms: 0,
+      },
+      queue: [],
+    });
+    await writeBatchState({ active: null, queue: [] });
+    expect(await libraryDb().batch_state.get("batch")).toBeUndefined();
+  });
+
+  it("touchBatchHeartbeat / releaseBatchOwnership / clearBatchState compose", async () => {
+    await writeBatchState({
+      active: {
+        project_id: "p1",
+        project_name: "P1",
+        started_at: 1,
+        input: SAMPLE_INPUT,
+        summary: {
+          translated: 0,
+          cached: 0,
+          flagged: 0,
+          failed: 0,
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          cost_usd: 0,
+          elapsed_s: 0,
+          total: 0,
+          paused_reason: null,
+          failures: [],
+        },
+        status: "running",
+        paused_reason: null,
+        owner_session_id: null,
+        heartbeat_ms: 0,
+      },
+      queue: [],
+    });
+
+    await touchBatchHeartbeat({ owner_session_id: "tab-X", heartbeat_ms: 50 });
+    let row = await readBatchState();
+    expect(row.active!.owner_session_id).toBe("tab-X");
+    expect(row.active!.heartbeat_ms).toBe(50);
+
+    await releaseBatchOwnership();
+    row = await readBatchState();
+    expect(row.active!.owner_session_id).toBeNull();
+    expect(row.active!.heartbeat_ms).toBe(50); // preserved
+
+    await clearBatchState();
+    expect(await readBatchState()).toEqual(EMPTY_BATCH_STATE);
   });
 });

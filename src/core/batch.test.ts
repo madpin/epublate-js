@@ -500,6 +500,84 @@ describe("runBatch", () => {
     expect(breaker_evt.length).toBeGreaterThanOrEqual(1);
   });
 
+  it("continues from a resume_baseline so the meter doesn't reset across refresh", async () => {
+    const bytes = await makeTestEpub();
+    const project = await createProject({
+      name: "Resume",
+      source_lang: "en",
+      target_lang: "pt",
+      source_filename: "rsm.epub",
+      source_bytes: bytes,
+    });
+    projectId = project.id;
+    await runProjectIntake({
+      project_id: project.id,
+      source_lang: project.source_lang,
+      target_lang: project.target_lang,
+      epub_bytes: bytes,
+      source_filename: "rsm.epub",
+    });
+
+    const provider = new MockProvider();
+    // Pretend the previous (interrupted) run already translated 12
+    // segments and cost a quarter cent. The new run must accumulate
+    // onto these counters and *grow* `total` to fit
+    // baseline_done + remaining_pending so the meter doesn't move
+    // backwards after the refresh.
+    const baseline = {
+      translated: 12,
+      cached: 0,
+      flagged: 0,
+      failed: 0,
+      prompt_tokens: 200,
+      completion_tokens: 800,
+      cost_usd: 0.0025,
+      elapsed_s: 5,
+      total: 30,
+      paused_reason: "stale leftover",
+      failures: [{ segment_id: "old", error: "stale" }],
+    };
+
+    const summary = await runBatch({
+      project_id: project.id,
+      source_lang: "en",
+      target_lang: "pt",
+      provider,
+      options: { model: "mock-model", concurrency: 2 },
+      resume_baseline: baseline,
+    });
+
+    // Baseline counters carried through plus the new translations.
+    expect(summary.translated).toBeGreaterThanOrEqual(12 + 3);
+    expect(summary.prompt_tokens).toBeGreaterThan(200);
+    expect(summary.cost_usd).toBeGreaterThanOrEqual(0.0025);
+    // Total = baseline_done (12) + remaining pending in the project.
+    const baseline_done = 12;
+    const new_pending = await openProjectDb(project.id).segments.count();
+    // pending count is whatever's still in PENDING status pre-run.
+    // We assert a sane lower bound rather than the exact value to
+    // avoid coupling to the test ePub's segmentation count.
+    expect(summary.total).toBeGreaterThanOrEqual(baseline_done + 1);
+    expect(summary.total).toBeLessThanOrEqual(baseline_done + new_pending);
+    // The stale paused_reason is wiped so the resumed run isn't
+    // misreported as paused once it completes.
+    expect(summary.paused_reason).toBeNull();
+    // Baseline failure entries survive the resume — the inbox still
+    // shows what went wrong before the refresh.
+    expect(summary.failures.find((f) => f.segment_id === "old")).toBeDefined();
+
+    // Audit trail records the resume so a future curator can tell
+    // a refresh-resume apart from a normal re-run.
+    const events = await openProjectDb(project.id).events.toArray();
+    const started = events.filter((e) => e.kind === "batch.started");
+    expect(started.length).toBeGreaterThanOrEqual(1);
+    const last_started = JSON.parse(
+      started[started.length - 1]!.payload_json,
+    ) as { resumed?: boolean; resumed_baseline_done?: number };
+    expect(last_started.resumed).toBe(true);
+    expect(last_started.resumed_baseline_done).toBe(12);
+  });
+
   it("filters by chapter_ids", async () => {
     const bytes = await makeTestEpub();
     const project = await createProject({
